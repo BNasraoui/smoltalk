@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "ChezWizper",
+  "project_id": "975b91be-8e83-45c2-aba3-01c68ec6fd00"
+}
