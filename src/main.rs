@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::api::{ApiCommand, ApiServer, AppStatus};
+use crate::api::{ApiCommand, ApiCommandSource, ApiServer, AppStatus};
 use crate::audio::{AudioStreamManager, RecordedAudio};
 use crate::config::Config;
 use crate::text_injection::TextInjector;
@@ -42,11 +42,6 @@ struct Args {
 struct RecordingState {
     status: Arc<Mutex<AppStatus>>,
     audio_recorder: Arc<Mutex<AudioStreamManager>>,
-}
-
-enum RecordingAction {
-    Start,
-    Stop,
 }
 
 #[tokio::main]
@@ -158,148 +153,133 @@ async fn main() -> Result<()> {
     // Main event loop
     while let Some(command) = rx.recv().await {
         match command {
-            ApiCommand::ToggleRecording => {
-                bench_trace::event("main_toggle_dequeued");
-                let action = {
-                    let mut status = state.status.lock().await;
-                    match *status {
-                        AppStatus::Idle => {
-                            *status = AppStatus::Recording;
-                            bench_trace::event("state_recording_set");
-                            RecordingAction::Start
-                        }
-                        AppStatus::Recording => {
-                            *status = AppStatus::Processing;
-                            bench_trace::event("state_processing_set");
-                            RecordingAction::Stop
-                        }
-                        AppStatus::Processing => {
-                            info!("Ignoring toggle while processing previous recording");
-                            continue;
-                        }
-                    }
+            ApiCommand::StartRecording(source) => {
+                emit_dequeue_event(source);
+                info!("Starting recording");
+
+                if let Err(e) = indicator.show_recording().await {
+                    error!("Failed to show recording indicator: {}", e);
+                }
+
+                let audio_recorder = state.audio_recorder.lock().await;
+                if let Err(e) = audio_recorder.start_recording().await {
+                    error!("Failed to start recording: {}", e);
+                    bench_trace::event_with_extra("trial_error", || {
+                        serde_json::json!({
+                            "phase": "audio_start",
+                            "error": e.to_string(),
+                        })
+                    });
+                    *state.status.lock().await = AppStatus::Idle;
+                    bench_trace::event("state_idle_set");
+                    let _ = indicator
+                        .show_error(&format!("Recording failed: {e}"))
+                        .await;
+                }
+            }
+            ApiCommand::StopRecording(source) => {
+                emit_dequeue_event(source);
+                info!("Stopping recording");
+
+                let temp_path = PathBuf::from(format!(
+                    "/tmp/chezwizper_{}.wav",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                ));
+
+                let stop_result = {
+                    let audio_recorder = state.audio_recorder.lock().await;
+                    audio_recorder.stop_recording(temp_path.clone()).await
                 };
 
-                if matches!(action, RecordingAction::Start) {
-                    // Start recording
-                    info!("Starting recording");
+                match stop_result {
+                    Ok(RecordedAudio::Speech(audio_path)) => {
+                        // Show processing indicator
+                        if let Err(e) = indicator.show_processing().await {
+                            error!("Failed to show processing indicator: {}", e);
+                        }
 
-                    if let Err(e) = indicator.show_recording().await {
-                        error!("Failed to show recording indicator: {}", e);
+                        // Transcribe audio
+                        match transcription_service.transcribe(&audio_path).await {
+                            Ok(text) => {
+                                if !text.is_empty() {
+                                    info!("Transcription successful: {} chars", text.len());
+
+                                    if config.behavior.auto_paste {
+                                        if let Err(e) = text_injector.inject_text(&text).await {
+                                            error!("Failed to inject text: {}", e);
+                                            let _ = indicator
+                                                .show_error(&format!(
+                                                    "Text injection failed: {e}. Transcript may be on clipboard if paste fallback copied it."
+                                                ))
+                                                .await;
+                                        }
+                                    }
+
+                                    // Show completion
+                                    if let Err(e) = indicator.show_complete(&text).await {
+                                        error!("Failed to show completion indicator: {}", e);
+                                    }
+                                } else {
+                                    let _ = indicator.show_error("No speech detected").await;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Transcription failed: {}", e);
+                                bench_trace::event_with_extra("trial_error", || {
+                                    serde_json::json!({
+                                        "phase": "transcription",
+                                        "error": e.to_string(),
+                                    })
+                                });
+                                let _ = indicator
+                                    .show_error(&format!("Transcription failed: {e}"))
+                                    .await;
+                            }
+                        }
+
+                        // Clean up audio file
+                        if config.behavior.delete_audio_files {
+                            let _ = std::fs::remove_file(&audio_path);
+                        }
                     }
-
-                    let audio_recorder = state.audio_recorder.lock().await;
-                    if let Err(e) = audio_recorder.start_recording().await {
-                        error!("Failed to start recording: {}", e);
+                    Ok(RecordedAudio::NoSpeech) => {
+                        bench_trace::event_with_extra("transcription_skipped", || {
+                            serde_json::json!({
+                                "reason": "no_speech",
+                            })
+                        });
+                        let _ = indicator.show_error("No speech detected").await;
+                    }
+                    Err(e) => {
+                        error!("Failed to stop recording: {}", e);
                         bench_trace::event_with_extra("trial_error", || {
                             serde_json::json!({
-                                "phase": "audio_start",
+                                "phase": "audio_stop",
                                 "error": e.to_string(),
                             })
                         });
-                        *state.status.lock().await = AppStatus::Idle;
-                        bench_trace::event("state_idle_set");
                         let _ = indicator
-                            .show_error(&format!("Recording failed: {e}"))
+                            .show_error(&format!("Failed to save audio: {e}"))
                             .await;
-                        continue;
                     }
-                } else {
-                    // Stop recording and process
-                    info!("Stopping recording");
-
-                    let temp_path = PathBuf::from(format!(
-                        "/tmp/chezwizper_{}.wav",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs()
-                    ));
-
-                    let stop_result = {
-                        let audio_recorder = state.audio_recorder.lock().await;
-                        audio_recorder.stop_recording(temp_path.clone()).await
-                    };
-
-                    match stop_result {
-                        Ok(RecordedAudio::Speech(audio_path)) => {
-                            // Show processing indicator
-                            if let Err(e) = indicator.show_processing().await {
-                                error!("Failed to show processing indicator: {}", e);
-                            }
-
-                            // Transcribe audio
-                            match transcription_service.transcribe(&audio_path).await {
-                                Ok(text) => {
-                                    if !text.is_empty() {
-                                        info!("Transcription successful: {} chars", text.len());
-
-                                        if config.behavior.auto_paste {
-                                            if let Err(e) = text_injector.inject_text(&text).await {
-                                                error!("Failed to inject text: {}", e);
-                                                let _ = indicator
-                                                    .show_error(&format!(
-                                                        "Text injection failed: {e}. Transcript may be on clipboard if paste fallback copied it."
-                                                    ))
-                                                    .await;
-                                            }
-                                        }
-
-                                        // Show completion
-                                        if let Err(e) = indicator.show_complete(&text).await {
-                                            error!("Failed to show completion indicator: {}", e);
-                                        }
-                                    } else {
-                                        let _ = indicator.show_error("No speech detected").await;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Transcription failed: {}", e);
-                                    bench_trace::event_with_extra("trial_error", || {
-                                        serde_json::json!({
-                                            "phase": "transcription",
-                                            "error": e.to_string(),
-                                        })
-                                    });
-                                    let _ = indicator
-                                        .show_error(&format!("Transcription failed: {e}"))
-                                        .await;
-                                }
-                            }
-
-                            // Clean up audio file
-                            if config.behavior.delete_audio_files {
-                                let _ = std::fs::remove_file(&audio_path);
-                            }
-                        }
-                        Ok(RecordedAudio::NoSpeech) => {
-                            bench_trace::event_with_extra("transcription_skipped", || {
-                                serde_json::json!({
-                                    "reason": "no_speech",
-                                })
-                            });
-                            let _ = indicator.show_error("No speech detected").await;
-                        }
-                        Err(e) => {
-                            error!("Failed to stop recording: {}", e);
-                            bench_trace::event_with_extra("trial_error", || {
-                                serde_json::json!({
-                                    "phase": "audio_stop",
-                                    "error": e.to_string(),
-                                })
-                            });
-                            let _ = indicator
-                                .show_error(&format!("Failed to save audio: {e}"))
-                                .await;
-                        }
-                    }
-
-                    *state.status.lock().await = AppStatus::Idle;
-                    bench_trace::event("state_idle_set");
                 }
+
+                *state.status.lock().await = AppStatus::Idle;
+                bench_trace::event("state_idle_set");
             }
         }
     }
 
     Ok(())
+}
+
+fn emit_dequeue_event(source: ApiCommandSource) {
+    match source {
+        ApiCommandSource::Start => bench_trace::event("main_start_dequeued"),
+        ApiCommandSource::Stop => bench_trace::event("main_stop_dequeued"),
+        ApiCommandSource::Toggle => bench_trace::event("main_toggle_dequeued"),
+    }
 }
