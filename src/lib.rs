@@ -1,5 +1,6 @@
 pub mod api;
 pub mod audio;
+pub mod bench_trace;
 pub mod clipboard;
 pub mod config;
 pub mod normalizer;

@@ -7,12 +7,27 @@ channels = 1
 # Provider selection (defaults to auto-detection if not specified)
 # Uncomment and set provider to explicitly choose:
 # provider = "whisper-cpp"    # Local whisper.cpp (built during install)
+# provider = "whisper-rs"     # Warm in-process whisper.cpp bindings
 # provider = "openai-cli"     # Local OpenAI Whisper CLI 
 # provider = "openai-api"     # OpenAI API (requires api_key)
 
 # Common settings
 model = "base"              # Model size: tiny, base, small, medium, large-v3, large-v3-turbo
 language = "en"             # Language code (en, es, fr, de, etc.)
+
+# Optional local whisper speed/reliability settings
+# threads = 1                # Try 1 or 2 on older/smaller CPUs; benchmark on your machine
+# beam_size = 1              # Lower is faster; higher may improve difficult audio
+# best_of = 1                # Lower is faster; higher explores more candidates
+# no_fallback = true         # Faster, but less robust for noisy/ambiguous audio
+# timeout_secs = 120         # Kill transcription if whisper.cpp wedges
+
+# whisper-rs settings (used when provider = "whisper-rs")
+# model = "base.en"                         # Prefers ggml-base.en-q5_0.bin when present
+# keep_warm_for_secs = 300                  # Idle-unload after this many seconds
+# audio_ctx = "auto"                        # auto = shrink encoder context per clip; 0/"off" = full 30s window; integer = explicit context
+# initial_prompt = "Transcribe concise technical dictation."
+# coding_vocabulary = "Rust, Axum, Tokio, whisper-rs, ChezWizper"
 
 # whisper.cpp settings (used when provider = "whisper-cpp")
 # command_path = "/path/to/whisper-cli"  # Optional custom path
@@ -42,9 +57,22 @@ idle_tooltip = "Press Super+R to record"
 recording_tooltip = "Recording... Press Super+R to stop"
 processing_tooltip = "Processing transcription..."
 
+[api]
+port = 3737                 # Local HTTP API port (toggle/status endpoints)
+
 [wayland]
 input_method = "wtype"
 use_hyprland_ipc = true
+
+[injection]
+# Short single-line text is typed directly so the clipboard is not touched.
+# Longer or multiline text uses a guarded paste transaction.
+paste_threshold_chars = 120
+# Optional: force_method = "type" or "paste"
+# force_method = "paste"
+# Restore is best-effort for plain text; wl-clipboard/X11 tools cannot perfectly
+# preserve rich, image, file, or clipboard-manager state.
+restore_clipboard = true
 
 [behavior]
 auto_paste = true

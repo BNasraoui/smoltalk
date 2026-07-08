@@ -1,0 +1,19 @@
+#!/bin/bash
+# Debounce mechanism - prevent multiple rapid triggers
+DEBOUNCE_FILE="/tmp/chezwizper-debounce"
+DEBOUNCE_TIME=2  # 2 second debounce
+
+# Check if we recently triggered
+if [ -f "$DEBOUNCE_FILE" ]; then
+    last_time=$(cat "$DEBOUNCE_FILE" 2>/dev/null || echo 0)
+    current_time=$(date +%s)
+    if [ $((current_time - last_time)) -lt $DEBOUNCE_TIME ]; then
+        exit 0  # Ignore rapid repeated presses
+    fi
+fi
+
+# Record this trigger time
+date +%s > "$DEBOUNCE_FILE"
+
+# Send the toggle command
+curl -s -X POST http://127.0.0.1:3737/toggle >/dev/null

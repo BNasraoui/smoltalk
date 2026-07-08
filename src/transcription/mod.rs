@@ -2,7 +2,9 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
+use crate::bench_trace;
 use crate::normalizer::Normalizer;
+use crate::whisper::provider::ModelStatusSnapshot;
 use crate::whisper::WhisperTranscriber;
 
 /// Service that orchestrates transcription and normalization
@@ -25,14 +27,35 @@ impl TranscriptionService {
     /// Transcribe audio file and return normalized text
     pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
         info!("Starting transcription pipeline for: {:?}", audio_path);
+        bench_trace::event_with_extra("transcription_begin", || {
+            serde_json::json!({
+                "audio_path": audio_path.display().to_string(),
+            })
+        });
 
         // Step 1: Get raw transcription from whisper
         debug!("Getting raw transcription from whisper");
         let raw_transcription = self.whisper.transcribe(audio_path).await?;
+        bench_trace::event_with_extra("transcription_raw_done", || {
+            serde_json::json!({
+                "raw_chars": raw_transcription.len(),
+            })
+        });
 
         // Step 2: Normalize the transcription
         debug!("Normalizing transcription output");
         let normalized = self.normalizer.run(&raw_transcription);
+        bench_trace::event_with_extra("normalization_done", || {
+            serde_json::json!({
+                "raw_chars": raw_transcription.len(),
+                "normalized_chars": normalized.len(),
+            })
+        });
+        bench_trace::event_with_extra("transcription_end", || {
+            serde_json::json!({
+                "text_chars": normalized.len(),
+            })
+        });
 
         info!(
             "Transcription pipeline complete: {} chars -> {} chars",
@@ -41,6 +64,22 @@ impl TranscriptionService {
         );
 
         Ok(normalized)
+    }
+
+    pub async fn prepare(&self) -> Result<()> {
+        self.whisper.prepare().await
+    }
+
+    pub fn model_status(&self) -> Option<ModelStatusSnapshot> {
+        self.whisper.model_status()
+    }
+
+    pub fn unload_model(&self) -> Result<()> {
+        self.whisper.unload_model()
+    }
+
+    pub async fn reload_model(&self) -> Result<()> {
+        self.whisper.reload_model().await
     }
 }
 

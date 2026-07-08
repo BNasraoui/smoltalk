@@ -6,6 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use tracing::{debug, error, info};
 
+use crate::bench_trace;
 use crate::whisper::provider::TranscriptionProvider;
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +70,7 @@ impl TranscriptionProvider for OpenAIProvider {
             let audio_data = tokio::fs::read(audio_path)
                 .await
                 .context("Failed to read audio file")?;
+            let audio_bytes = audio_data.len();
 
             let filename = audio_path
                 .file_name()
@@ -95,6 +97,16 @@ impl TranscriptionProvider for OpenAIProvider {
                 self.model, language
             );
 
+            bench_trace::event_with_extra("provider_api_request_begin", || {
+                serde_json::json!({
+                    "provider": "OpenAI API",
+                    "endpoint": self.endpoint.as_str(),
+                    "model": self.model.as_str(),
+                    "language": language,
+                    "audio_bytes": audio_bytes,
+                })
+            });
+
             let response = self
                 .client
                 .post(&self.endpoint)
@@ -109,6 +121,14 @@ impl TranscriptionProvider for OpenAIProvider {
                 .text()
                 .await
                 .context("Failed to read response body")?;
+            bench_trace::event_with_extra("provider_api_request_end", || {
+                serde_json::json!({
+                    "provider": "OpenAI API",
+                    "status": status.as_u16(),
+                    "success": status.is_success(),
+                    "response_bytes": response_text.len(),
+                })
+            });
 
             if !status.is_success() {
                 error!(

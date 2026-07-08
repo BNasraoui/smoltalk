@@ -1,10 +1,48 @@
 use crate::config::UiConfig;
-use anyhow::Result;
-use std::process::Command;
+use anyhow::{Context, Result};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(1);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().context("Failed to spawn command")?;
+    wait_for_child_with_timeout(&mut child, timeout)?;
+
+    child
+        .wait_with_output()
+        .context("Failed to collect command output")
+}
+
+fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait().context("Failed to check command status")? {
+            return Ok(status);
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::anyhow!(
+                "command timed out after {}ms",
+                timeout.as_millis()
+            ));
+        }
+
+        thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+}
 
 pub struct Indicator {
     audio_feedback_enabled: bool,
+    notifications_enabled: bool,
     notification_color: String,
 }
 
@@ -18,6 +56,7 @@ impl Indicator {
     pub fn new() -> Self {
         Self {
             audio_feedback_enabled: true,
+            notifications_enabled: true,
             notification_color: "rgb(ff1744)".to_string(),
         }
     }
@@ -25,6 +64,7 @@ impl Indicator {
     pub fn from_config(config: &UiConfig) -> Self {
         Self {
             audio_feedback_enabled: true,
+            notifications_enabled: config.show_notifications,
             notification_color: config.notification_color.clone(),
         }
     }
@@ -63,10 +103,12 @@ impl Indicator {
     pub async fn show_complete(&self, text: &str) -> Result<()> {
         info!("Showing completion indicator");
 
-        let preview = if text.len() > 50 {
-            format!("{}...", &text[..50])
+        let mut chars = text.chars();
+        let preview: String = chars.by_ref().take(50).collect();
+        let preview = if chars.next().is_some() {
+            format!("{preview}...")
         } else {
-            text.to_string()
+            preview
         };
 
         if let Err(e) = self.hyprland_notify(&format!("󰸞 {preview}")) {
@@ -90,9 +132,13 @@ impl Indicator {
     }
 
     fn hyprland_notify(&self, title: &str) -> Result<()> {
-        Command::new("hyprctl")
-            .args(["notify", "-1", "3000", &self.notification_color, title])
-            .output()?;
+        if !self.notifications_enabled {
+            return Ok(());
+        }
+
+        let mut command = Command::new("hyprctl");
+        command.args(["notify", "-1", "3000", &self.notification_color, title]);
+        command_output_with_timeout(&mut command, HYPRCTL_TIMEOUT)?;
 
         Ok(())
     }
@@ -205,5 +251,34 @@ for i in range(samples):
         }
 
         Err(anyhow::anyhow!("No tone generation method available"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_config_honors_show_notifications() {
+        let config = UiConfig {
+            show_notifications: false,
+            ..Default::default()
+        };
+
+        let indicator = Indicator::from_config(&config);
+
+        assert!(!indicator.notifications_enabled);
+    }
+
+    #[tokio::test]
+    async fn show_complete_handles_long_non_ascii_text() {
+        let config = UiConfig {
+            show_notifications: false,
+            ..Default::default()
+        };
+        let indicator = Indicator::from_config(&config).with_audio_feedback(false);
+        let text = "語".repeat(60);
+
+        indicator.show_complete(&text).await.unwrap();
     }
 }

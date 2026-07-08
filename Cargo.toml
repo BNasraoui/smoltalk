@@ -22,6 +22,7 @@ tokio = { version = "1.35", features = ["full"] }
 # Audio recording
 cpal = "0.15"
 hound = "3.5"
+whisper-rs = { version = "0.16", features = ["openmp"] }
 
 # Wayland integration
 wayland-client = "0.31"

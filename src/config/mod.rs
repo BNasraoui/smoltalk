@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::info;
 
+use crate::whisper::AudioCtxConfig;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -11,6 +13,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
+    pub injection: InjectionConfig,
+    pub api: ApiConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +35,15 @@ pub struct WhisperConfig {
     pub api_endpoint: Option<String>,
     pub provider: Option<String>,
     pub api_key: Option<String>,
+    pub threads: Option<u32>,
+    pub beam_size: Option<u32>,
+    pub best_of: Option<u32>,
+    pub no_fallback: Option<bool>,
+    pub timeout_secs: Option<u64>,
+    pub keep_warm_for_secs: Option<u64>,
+    pub initial_prompt: Option<String>,
+    pub coding_vocabulary: Option<String>,
+    pub audio_ctx: AudioCtxConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +90,35 @@ fn default_audio_feedback() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InjectionConfig {
+    pub paste_threshold_chars: usize,
+    pub force_method: Option<InjectionForceMethod>,
+    pub restore_clipboard: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectionForceMethod {
+    Type,
+    Paste,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    pub port: u16,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            port: 3737, // WHSP in numbers
+        }
+    }
+}
+
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +139,15 @@ impl Default for WhisperConfig {
             api_endpoint: Some("https://api.openai.com/v1/audio/transcriptions".to_string()),
             provider: None,
             api_key: None,
+            threads: None,
+            beam_size: None,
+            best_of: None,
+            no_fallback: None,
+            timeout_secs: None,
+            keep_warm_for_secs: Some(300),
+            initial_prompt: None,
+            coding_vocabulary: None,
+            audio_ctx: AudioCtxConfig::Auto,
         }
     }
 }
@@ -148,6 +199,16 @@ impl Default for BehaviorConfig {
     }
 }
 
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self {
+            paste_threshold_chars: 120,
+            force_method: None,
+            restore_clipboard: true,
+        }
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
@@ -192,5 +253,48 @@ impl Config {
         let config_dir = dirs::config_dir().context("Failed to determine config directory")?;
 
         Ok(config_dir.join("chezwizper").join("config.toml"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_port_defaults_when_section_is_missing() {
+        let config: Config = toml::from_str("[audio]\ndevice = \"default\"\n").unwrap();
+
+        assert_eq!(config.api.port, 3737);
+    }
+
+    #[test]
+    fn api_port_honors_explicit_value() {
+        let config: Config = toml::from_str("[api]\nport = 4848\n").unwrap();
+
+        assert_eq!(config.api.port, 4848);
+    }
+
+    #[test]
+    fn injection_defaults_when_section_is_missing() {
+        let config: Config = toml::from_str("[audio]\ndevice = \"default\"\n").unwrap();
+
+        assert_eq!(config.injection.paste_threshold_chars, 120);
+        assert_eq!(config.injection.force_method, None);
+        assert!(config.injection.restore_clipboard);
+    }
+
+    #[test]
+    fn injection_honors_explicit_values() {
+        let config: Config = toml::from_str(
+            "[injection]\npaste_threshold_chars = 42\nforce_method = \"paste\"\nrestore_clipboard = false\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.injection.paste_threshold_chars, 42);
+        assert_eq!(
+            config.injection.force_method,
+            Some(InjectionForceMethod::Paste)
+        );
+        assert!(!config.injection.restore_clipboard);
     }
 }

@@ -6,6 +6,7 @@ use std::process::Command;
 use tracing::{error, info};
 use which::which;
 
+use crate::bench_trace;
 use crate::whisper::provider::TranscriptionProvider;
 
 pub struct OpenAIWhisperCliProvider {
@@ -77,7 +78,8 @@ impl TranscriptionProvider for OpenAIWhisperCliProvider {
         Box::pin(async move {
             info!("Using OpenAI Whisper CLI to transcribe: {:?}", audio_path);
 
-            let output = Command::new(&command_path)
+            let mut command = Command::new(&command_path);
+            command
                 .arg(&audio_path)
                 .arg("--model")
                 .arg(&model)
@@ -86,9 +88,27 @@ impl TranscriptionProvider for OpenAIWhisperCliProvider {
                 .arg("--output_format")
                 .arg("txt")
                 .arg("--output_dir")
-                .arg("/tmp")
+                .arg("/tmp");
+
+            bench_trace::event_with_extra("provider_command_spawn", || {
+                serde_json::json!({
+                    "provider": "OpenAI Whisper CLI",
+                    "command": format!("{command:?}"),
+                    "model": model,
+                    "language": language,
+                })
+            });
+
+            let output = command
                 .output()
                 .context("Failed to execute whisper command")?;
+            bench_trace::event_with_extra("provider_command_exit", || {
+                serde_json::json!({
+                    "provider": "OpenAI Whisper CLI",
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                })
+            });
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

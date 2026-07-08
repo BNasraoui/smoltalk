@@ -2,7 +2,7 @@
 
 mod api;
 mod audio;
-mod clipboard;
+mod bench_trace;
 mod config;
 mod normalizer;
 mod text_injection;
@@ -18,9 +18,8 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::api::{ApiCommand, ApiServer};
+use crate::api::{ApiCommand, ApiServer, AppStatus};
 use crate::audio::AudioStreamManager;
-use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::text_injection::TextInjector;
 use crate::transcription::TranscriptionService;
@@ -40,8 +39,13 @@ struct Args {
 
 #[derive(Clone)]
 struct RecordingState {
-    recording: Arc<Mutex<bool>>,
+    status: Arc<Mutex<AppStatus>>,
     audio_recorder: Arc<Mutex<AudioStreamManager>>,
+}
+
+enum RecordingAction {
+    Start,
+    Stop,
 }
 
 #[tokio::main]
@@ -55,6 +59,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     info!("Starting ChezWizper");
+    bench_trace::event("daemon_start");
 
     // Load configuration
     let config = if let Some(config_path) = args.config {
@@ -76,6 +81,15 @@ async fn main() -> Result<()> {
             command_path: config.whisper.command_path.clone(),
             api_endpoint: config.whisper.api_endpoint.clone(),
             api_key: config.whisper.api_key.clone(),
+            threads: config.whisper.threads,
+            beam_size: config.whisper.beam_size,
+            best_of: config.whisper.best_of,
+            no_fallback: config.whisper.no_fallback,
+            timeout_secs: config.whisper.timeout_secs,
+            keep_warm_for_secs: config.whisper.keep_warm_for_secs,
+            initial_prompt: config.whisper.initial_prompt.clone(),
+            coding_vocabulary: config.whisper.coding_vocabulary.clone(),
+            audio_ctx: config.whisper.audio_ctx,
         };
         WhisperTranscriber::with_provider(provider, provider_config)?
     } else {
@@ -87,27 +101,44 @@ async fn main() -> Result<()> {
             command_path: config.whisper.command_path.clone(),
             api_endpoint: config.whisper.api_endpoint.clone(),
             api_key: config.whisper.api_key.clone(),
+            threads: config.whisper.threads,
+            beam_size: config.whisper.beam_size,
+            best_of: config.whisper.best_of,
+            no_fallback: config.whisper.no_fallback,
+            timeout_secs: config.whisper.timeout_secs,
+            keep_warm_for_secs: config.whisper.keep_warm_for_secs,
+            initial_prompt: config.whisper.initial_prompt.clone(),
+            coding_vocabulary: config.whisper.coding_vocabulary.clone(),
+            audio_ctx: config.whisper.audio_ctx,
         };
         WhisperTranscriber::auto_detect(provider_config)?
     };
 
     // Compose transcription service with whisper and normalizer
-    let transcription_service = TranscriptionService::new(whisper)?;
+    let transcription_service = Arc::new(TranscriptionService::new(whisper)?);
+    if let Err(e) = transcription_service.prepare().await {
+        error!("Transcription provider preload failed: {}", e);
+    }
 
-    let text_injector = TextInjector::new(Some(&config.wayland.input_method))?;
-    let mut clipboard = ClipboardManager::new()?.with_preserve(config.behavior.preserve_clipboard);
+    let text_injector =
+        TextInjector::new(Some(&config.wayland.input_method), config.injection.clone())?;
 
     let indicator =
         Indicator::from_config(&config.ui).with_audio_feedback(config.behavior.audio_feedback);
 
-    let recording_flag = Arc::new(Mutex::new(false));
+    let app_status = Arc::new(Mutex::new(AppStatus::Idle));
     let state = RecordingState {
-        recording: recording_flag.clone(),
+        status: app_status.clone(),
         audio_recorder: Arc::new(Mutex::new(audio_recorder)),
     };
 
     // Create and start API server
-    let api_server = ApiServer::new(tx, recording_flag.clone(), &config);
+    let api_server = ApiServer::new(
+        tx,
+        app_status.clone(),
+        &config,
+        transcription_service.clone(),
+    );
 
     // Start API server in background
     tokio::spawn(async move {
@@ -118,6 +149,7 @@ async fn main() -> Result<()> {
 
     // Print instructions for Hyprland setup
     info!("ChezWizper is ready!");
+    bench_trace::event("daemon_ready");
     info!("Add this to your Hyprland config:");
     info!("bindd = SUPER, R, ChezWizper, exec, curl -X POST http://127.0.0.1:3737/toggle");
     info!("Or test manually: curl -X POST http://127.0.0.1:3737/toggle");
@@ -126,10 +158,28 @@ async fn main() -> Result<()> {
     while let Some(command) = rx.recv().await {
         match command {
             ApiCommand::ToggleRecording => {
-                let mut recording = state.recording.lock().await;
-                *recording = !*recording;
+                bench_trace::event("main_toggle_dequeued");
+                let action = {
+                    let mut status = state.status.lock().await;
+                    match *status {
+                        AppStatus::Idle => {
+                            *status = AppStatus::Recording;
+                            bench_trace::event("state_recording_set");
+                            RecordingAction::Start
+                        }
+                        AppStatus::Recording => {
+                            *status = AppStatus::Processing;
+                            bench_trace::event("state_processing_set");
+                            RecordingAction::Stop
+                        }
+                        AppStatus::Processing => {
+                            info!("Ignoring toggle while processing previous recording");
+                            continue;
+                        }
+                    }
+                };
 
-                if *recording {
+                if matches!(action, RecordingAction::Start) {
                     // Start recording
                     info!("Starting recording");
 
@@ -140,7 +190,14 @@ async fn main() -> Result<()> {
                     let audio_recorder = state.audio_recorder.lock().await;
                     if let Err(e) = audio_recorder.start_recording().await {
                         error!("Failed to start recording: {}", e);
-                        *recording = false;
+                        bench_trace::event_with_extra("trial_error", || {
+                            serde_json::json!({
+                                "phase": "audio_start",
+                                "error": e.to_string(),
+                            })
+                        });
+                        *state.status.lock().await = AppStatus::Idle;
+                        bench_trace::event("state_idle_set");
                         let _ = indicator
                             .show_error(&format!("Recording failed: {e}"))
                             .await;
@@ -150,7 +207,6 @@ async fn main() -> Result<()> {
                     // Stop recording and process
                     info!("Stopping recording");
 
-                    let audio_recorder = state.audio_recorder.lock().await;
                     let temp_path = PathBuf::from(format!(
                         "/tmp/chezwizper_{}.wav",
                         std::time::SystemTime::now()
@@ -159,7 +215,12 @@ async fn main() -> Result<()> {
                             .as_secs()
                     ));
 
-                    match audio_recorder.stop_recording(temp_path.clone()).await {
+                    let stop_result = {
+                        let audio_recorder = state.audio_recorder.lock().await;
+                        audio_recorder.stop_recording(temp_path.clone()).await
+                    };
+
+                    match stop_result {
                         Ok(_) => {
                             // Show processing indicator
                             if let Err(e) = indicator.show_processing().await {
@@ -172,21 +233,14 @@ async fn main() -> Result<()> {
                                     if !text.is_empty() {
                                         info!("Transcription successful: {} chars", text.len());
 
-                                        // Copy to clipboard
-                                        if let Err(e) =
-                                            clipboard.copy_with_wayland_fallback(&text).await
-                                        {
-                                            error!("Failed to copy to clipboard: {}", e);
-                                        }
-
-                                        // Inject text or paste
                                         if config.behavior.auto_paste {
                                             if let Err(e) = text_injector.inject_text(&text).await {
-                                                error!(
-                                                    "Failed to inject text: {}, trying paste",
-                                                    e
-                                                );
-                                                let _ = text_injector.paste_from_clipboard().await;
+                                                error!("Failed to inject text: {}", e);
+                                                let _ = indicator
+                                                    .show_error(&format!(
+                                                        "Text injection failed: {e}. Transcript may be on clipboard if paste fallback copied it."
+                                                    ))
+                                                    .await;
                                             }
                                         }
 
@@ -200,6 +254,12 @@ async fn main() -> Result<()> {
                                 }
                                 Err(e) => {
                                     error!("Transcription failed: {}", e);
+                                    bench_trace::event_with_extra("trial_error", || {
+                                        serde_json::json!({
+                                            "phase": "transcription",
+                                            "error": e.to_string(),
+                                        })
+                                    });
                                     let _ = indicator
                                         .show_error(&format!("Transcription failed: {e}"))
                                         .await;
@@ -213,11 +273,20 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             error!("Failed to stop recording: {}", e);
+                            bench_trace::event_with_extra("trial_error", || {
+                                serde_json::json!({
+                                    "phase": "audio_stop",
+                                    "error": e.to_string(),
+                                })
+                            });
                             let _ = indicator
                                 .show_error(&format!("Failed to save audio: {e}"))
                                 .await;
                         }
                     }
+
+                    *state.status.lock().await = AppStatus::Idle;
+                    bench_trace::event("state_idle_set");
                 }
             }
         }

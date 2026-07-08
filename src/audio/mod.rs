@@ -3,9 +3,12 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
+
+use crate::bench_trace;
 
 /// State of the audio recording session
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,6 +25,7 @@ pub struct AudioStreamManager {
     samples: Arc<Mutex<Vec<f32>>>,
     active_stream: Arc<Mutex<Option<cpal::Stream>>>,
     state: Arc<Mutex<RecordingState>>,
+    first_sample_seen: Arc<AtomicBool>,
 }
 
 impl AudioStreamManager {
@@ -47,11 +51,13 @@ impl AudioStreamManager {
             samples: Arc::new(Mutex::new(Vec::new())),
             active_stream: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(RecordingState::Idle)),
+            first_sample_seen: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Start recording audio, properly managing stream lifecycle
     pub async fn start_recording(&self) -> Result<()> {
+        bench_trace::event("audio_start_begin");
         let mut state = self.state.lock().unwrap();
 
         match *state {
@@ -73,15 +79,24 @@ impl AudioStreamManager {
             samples.clear();
             samples.shrink_to_fit(); // Free memory from previous recordings
         }
+        self.first_sample_seen.store(false, Ordering::Relaxed);
 
         debug!("Creating new audio stream");
 
         let samples_clone = self.samples.clone();
+        let first_sample_seen = self.first_sample_seen.clone();
         let err_fn = |err| error!("Audio stream error: {}", err);
 
         let stream = self.device.build_input_stream(
             &self.config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if !data.is_empty() && !first_sample_seen.swap(true, Ordering::Relaxed) {
+                    bench_trace::event_with_extra("audio_first_sample", || {
+                        serde_json::json!({
+                            "samples": data.len(),
+                        })
+                    });
+                }
                 if let Ok(mut samples) = samples_clone.lock() {
                     samples.extend_from_slice(data);
                 }
@@ -91,6 +106,7 @@ impl AudioStreamManager {
         )?;
 
         stream.play()?;
+        bench_trace::event("audio_stream_played");
         info!("Started audio recording");
 
         // Store stream for proper cleanup
@@ -102,6 +118,11 @@ impl AudioStreamManager {
 
     /// Stop recording and save audio to file
     pub async fn stop_recording(&self, output_path: PathBuf) -> Result<PathBuf> {
+        bench_trace::event_with_extra("audio_stop_begin", || {
+            serde_json::json!({
+                "output_path": output_path.display().to_string(),
+            })
+        });
         let mut state = self.state.lock().unwrap();
 
         match *state {
@@ -120,41 +141,33 @@ impl AudioStreamManager {
         // Stop and cleanup stream
         self.cleanup_stream();
 
-        // Extract samples
-        let samples = {
-            let samples_guard = self.samples.lock().unwrap();
-            samples_guard.clone()
-        };
+        // Move samples out without copying the full recording buffer.
+        let samples = take_samples(&self.samples);
+        bench_trace::event_with_extra("samples_taken", || {
+            serde_json::json!({
+                "samples": samples.len(),
+                "sample_rate": self.config.sample_rate.0,
+            })
+        });
 
         if samples.is_empty() {
             *self.state.lock().unwrap() = RecordingState::Idle;
+            bench_trace::event_with_extra("trial_error", || {
+                serde_json::json!({
+                    "phase": "samples_taken",
+                    "error": "No audio samples recorded",
+                })
+            });
             return Err(anyhow::anyhow!("No audio samples recorded"));
         }
 
         info!("Stopping recording, {} samples captured", samples.len());
 
-        // Write WAV file
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate: 16000,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-
-        let mut writer = WavWriter::create(&output_path, spec)?;
-        for sample in samples {
-            writer.write_sample(sample)?;
-        }
-        writer.finalize()?;
-
-        // Clear samples and reset state
-        {
-            let mut samples = self.samples.lock().unwrap();
-            samples.clear();
-            samples.shrink_to_fit();
-        }
+        let write_result = write_samples_to_wav(&output_path, &samples);
 
         *self.state.lock().unwrap() = RecordingState::Idle;
+
+        write_result?;
 
         info!("Audio saved to: {:?}", output_path);
         Ok(output_path)
@@ -167,8 +180,49 @@ impl AudioStreamManager {
             debug!("Cleaning up audio stream");
             // Stream is automatically stopped when dropped
             drop(stream);
+            bench_trace::event("audio_stream_dropped");
         }
     }
+}
+
+fn take_samples(samples: &Arc<Mutex<Vec<f32>>>) -> Vec<f32> {
+    let mut samples = samples.lock().unwrap();
+    std::mem::take(&mut *samples)
+}
+
+fn write_samples_to_wav(output_path: &Path, samples: &[f32]) -> Result<()> {
+    bench_trace::event_with_extra("wav_write_begin", || {
+        serde_json::json!({
+            "output_path": output_path.display().to_string(),
+            "samples": samples.len(),
+        })
+    });
+
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer = WavWriter::create(output_path, spec)?;
+    for sample in samples {
+        writer.write_sample(*sample)?;
+    }
+    writer.finalize()?;
+
+    let wav_bytes = std::fs::metadata(output_path)
+        .map(|metadata| metadata.len())
+        .ok();
+    bench_trace::event_with_extra("wav_write_done", || {
+        serde_json::json!({
+            "output_path": output_path.display().to_string(),
+            "samples": samples.len(),
+            "wav_bytes": wav_bytes,
+        })
+    });
+
+    Ok(())
 }
 
 impl Drop for AudioStreamManager {
@@ -198,5 +252,15 @@ mod tests {
 
         // This test may fail in CI without audio devices
         let _manager = AudioStreamManager::new();
+    }
+
+    #[test]
+    fn take_samples_moves_recorded_samples_out_of_shared_buffer() {
+        let samples = Arc::new(Mutex::new(vec![0.1, 0.2, 0.3]));
+
+        let taken = take_samples(&samples);
+
+        assert_eq!(taken, vec![0.1, 0.2, 0.3]);
+        assert!(samples.lock().unwrap().is_empty());
     }
 }
