@@ -406,7 +406,9 @@ class PlaybackAudioSource(AudioSource):
     def verify(self):
         # parecord targets the monitor explicitly; pw-record must NOT be used
         # here — it ignores PULSE_SOURCE and silently records the microphone.
-        with tempfile.NamedTemporaryFile(suffix=".wav") as capture, tempfile.NamedTemporaryFile(suffix=".wav") as tone:
+        # Capture raw s16le: parecord only finalizes a WAV header on clean
+        # exit, and we stop it with SIGTERM.
+        with tempfile.NamedTemporaryFile(suffix=".raw") as capture, tempfile.NamedTemporaryFile(suffix=".wav") as tone:
             self._write_tone(Path(tone.name))
             recorder = subprocess.Popen(
                 [
@@ -414,12 +416,17 @@ class PlaybackAudioSource(AudioSource):
                     f"--device={self.sink_name}.monitor",
                     f"--rate={self.rate}",
                     "--channels=1",
+                    "--format=s16le",
+                    "--raw",
+                    # Default fragsize is 2s of audio; short captures would be
+                    # killed before the first fragment ever reaches the file.
+                    "--latency-msec=100",
                     capture.name,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(0.2)
+            time.sleep(0.5)
             subprocess.run(["paplay", "--device", self.sink_name, tone.name], check=True)
             time.sleep(0.3)
             recorder.terminate()
@@ -428,7 +435,8 @@ class PlaybackAudioSource(AudioSource):
             except subprocess.TimeoutExpired:
                 recorder.kill()
                 recorder.wait()
-            if not wav_has_signal(Path(capture.name)):
+            data = Path(capture.name).read_bytes()
+            if not any(byte != 0 for byte in data):
                 raise RuntimeError("loopback verification captured silence")
 
     def record_once(self, phrase):
@@ -452,8 +460,10 @@ class PlaybackAudioSource(AudioSource):
         import math
         import wave
 
+        # 1s: monitors only emit frames while a stream is playing, and the
+        # recorder needs time to connect before the tone ends.
         frames = bytearray()
-        for i in range(int(self.rate * 0.25)):
+        for i in range(int(self.rate * 1.0)):
             sample = int(12000 * math.sin(2 * math.pi * 440 * i / self.rate))
             frames.extend(sample.to_bytes(2, "little", signed=True))
         with wave.open(str(path), "wb") as wav:
@@ -555,10 +565,24 @@ def build_trial_row(run_id, trial_id, phrase, trial_events, provider, model, mod
         "peak_rss_mb": resources.peak_rss_mb,
         "cpu_user_ms": resources.cpu_user_ms,
         "cpu_system_ms": resources.cpu_system_ms,
+        "cpu_temp_c": read_max_cpu_temp(),
         "text": None,
         "status": status,
         "error": failure.get("extra", {}).get("error") if failure else None,
     }
+
+
+def read_max_cpu_temp():
+    """Max core temperature in °C, or None. Thermal throttling silently
+    invalidates latency comparisons — every trial records the temp so hot
+    runs are identifiable after the fact."""
+    temps = []
+    for zone in Path("/sys/class/hwmon").glob("hwmon*/temp*_input"):
+        try:
+            temps.append(int(zone.read_text().strip()) / 1000)
+        except (OSError, ValueError):
+            continue
+    return round(max(temps), 1) if temps else None
 
 
 def collect_until_idle(reader, deadline):
