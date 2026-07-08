@@ -1,4 +1,4 @@
-# ChezWizper Installation Guide
+# smoltalk Installation Guide
 
 Complete installation instructions for different operating systems and environments.
 
@@ -9,15 +9,15 @@ Complete installation instructions for different operating systems and environme
 For users running Omarchy on Arch Linux, use the automated installer:
 
 ```bash
-git clone https://github.com/silvabyte/ChezWizper.git
-cd ChezWizper
+git clone https://github.com/BNasraoui/smoltalk.git
+cd smoltalk
 make install
 ```
 
 This installer:
 - Installs all system dependencies (Rust, ydotool, wtype, wl-clipboard, etc.)
 - Builds optimized Whisper.cpp with large-v3-turbo model
-- Compiles and installs ChezWizper
+- Compiles and installs smoltalk
 - Creates systemd user service
 - Sets up update mechanism
 - Creates proper configuration
@@ -26,13 +26,13 @@ This installer:
 ```bash
 make install              # Normal install with smart detection
 make install -- --clean   # Fresh install from scratch
-make install -- --skip-whisper  # Update only ChezWizper
-make install -- --rebuild       # Force rebuild ChezWizper
+make install -- --skip-whisper  # Update only smoltalk
+make install -- --rebuild       # Force rebuild smoltalk
 ```
 
 **Post-installation steps:**
 1. `make start` - Enable and start the service
-2. Add to Hyprland config: `bindd = SUPER, R, ChezWizper, exec, curl -X POST http://127.0.0.1:3737/toggle`
+2. Add to Hyprland config: `bindd = SUPER, R, smoltalk, exec, curl -X POST http://127.0.0.1:3737/toggle`
 
 ## Manual Installation
 
@@ -77,7 +77,7 @@ sudo dnf install rust cargo ydotool cmake gcc-c++ alsa-lib-devel curl openssl-de
 
 ### Text Injection Setup
 
-ChezWizper requires a text injection method. See the [Text Injection Setup Guide](./text-injection-setup.md) for detailed configuration.
+smoltalk requires a text injection method. See the [Text Injection Setup Guide](./text-injection-setup.md) for detailed configuration.
 
 **Quick setup for ydotool (recommended):**
 
@@ -92,7 +92,7 @@ source ~/.bashrc
 
 ## Whisper Installation Options
 
-ChezWizper supports multiple Whisper implementations:
+smoltalk supports multiple Whisper implementations:
 
 ### Option 1: Optimized whisper.cpp (Recommended)
 
@@ -121,12 +121,12 @@ make
 ./models/download-ggml-model.sh base
 ```
 
-## Building ChezWizper
+## Building smoltalk
 
 ```bash
 # Clone the repository
-git clone https://github.com/silvabyte/ChezWizper.git
-cd ChezWizper
+git clone https://github.com/BNasraoui/smoltalk.git
+cd smoltalk
 
 # Build release version
 cargo build --release
@@ -144,7 +144,7 @@ Create the configuration directory and file:
 mkdir -p ~/.config/chezwizper
 ```
 
-ChezWizper will create a default config on first run, or you can create one manually:
+smoltalk will create a default config on first run, or you can create one manually:
 
 ### For Optimized Whisper.cpp
 
@@ -219,7 +219,7 @@ Create `~/.config/systemd/user/chezwizper.service`:
 
 ```ini
 [Unit]
-Description=ChezWizper Voice Transcription Service
+Description=smoltalk Voice Transcription Service
 After=graphical-session.target
 
 [Service]
@@ -247,12 +247,12 @@ systemctl --user enable --now chezwizper.service
 Add to your Hyprland config (`~/.config/hypr/hyprland.conf`):
 
 ```
-bindd = SUPER, R, ChezWizper, exec, curl -X POST http://127.0.0.1:3737/toggle
+bindd = SUPER, R, smoltalk, exec, curl -X POST http://127.0.0.1:3737/toggle
 ```
 
 For Omarchy users:
 ```
-bindd = SUPER, R, ChezWizper, exec, $terminal -e curl -X POST http://127.0.0.1:3737/toggle
+bindd = SUPER, R, smoltalk, exec, $terminal -e curl -X POST http://127.0.0.1:3737/toggle
 ```
 
 ## GNOME + Wayland Setup
@@ -294,7 +294,7 @@ systemctl --user enable --now ydotoold.service
 systemctl --user enable --now chezwizper.service
 ```
 
-### 2. Configure ChezWizper for GNOME
+### 2. Configure smoltalk for GNOME
 
 ```toml
 [wayland]
@@ -350,8 +350,8 @@ use_hyprland_ipc = false
 The automated installer sets up an update mechanism:
 
 ```bash
-chezwizper-update                    # Update ChezWizper only
-chezwizper-update --whisper          # Update both ChezWizper and Whisper
+chezwizper-update                    # Update smoltalk only
+chezwizper-update --whisper          # Update both smoltalk and Whisper
 chezwizper-update --check            # Check for available updates
 chezwizper-update --force            # Force update even if up-to-date
 ```

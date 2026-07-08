@@ -1,10 +1,10 @@
 # Waybar Integration
 
-Add ChezWizper status indicators to your Waybar.
+Add smoltalk status indicators to your Waybar.
 
 ## Setup
 
-### 1. Add ChezWizper Module to Waybar Config
+### 1. Add smoltalk Module to Waybar Config
 
 Add the module to your modules list and configuration:
 
@@ -47,7 +47,7 @@ Example response:
 
 ## Customization
 
-Customize icons and tooltips in your ChezWizper config (`~/.config/chezwizper/config.toml`):
+Customize icons and tooltips in your smoltalk config (`~/.config/chezwizper/config.toml`):
 
 ```toml
 [ui.waybar]
@@ -71,7 +71,7 @@ CSS styling (optional):
 
 **Module not appearing**: Ensure `"custom/chezwizper"` is added to a module list (modules-left, modules-center, or modules-right).
 
-**Shows "N/A" or error**: Check ChezWizper is running: `curl http://127.0.0.1:3737/status`
+**Shows "N/A" or error**: Check smoltalk is running: `curl http://127.0.0.1:3737/status`
 
 **Click not working**: Test the command manually: `curl -X POST http://127.0.0.1:3737/toggle`
 

@@ -1,6 +1,6 @@
-# ChezWizper Configuration Guide
+# smoltalk Configuration Guide
 
-ChezWizper is configured via a single TOML file located at `~/.config/chezwizper/config.toml`. This guide covers everything you need to know about configuring ChezWizper for your needs.
+smoltalk is configured via a single TOML file located at `~/.config/chezwizper/config.toml`. This guide covers everything you need to know about configuring smoltalk for your needs.
 
 ## Quick Start
 
@@ -8,15 +8,13 @@ The minimal configuration to get started:
 
 ```toml
 [whisper]
-# Auto-detection (recommended) - ChezWizper will automatically choose the best provider
+# Recommended: the warm in-process provider (fastest by a wide margin)
+provider = "whisper-rs"
+model = "base.en"
 language = "en"
-
-# For OpenAI API access, add your key to config:
-# provider = "openai-api"
-# api_key = "sk-your-api-key-here"
 ```
 
-ChezWizper will create a default configuration file on first run if none exists.
+smoltalk will create a default configuration file on first run if none exists.
 
 ## Complete Configuration Example
 
@@ -29,13 +27,30 @@ sample_rate = 16000             # Sample rate in Hz (8000, 16000, 44100, 48000)
 channels = 1                    # Number of audio channels (1 = mono, 2 = stereo)
 
 [whisper]
-provider = "openai-api"         # Transcription provider (see Providers section)
-api_key = "sk-your-api-key-here" # API key for API providers
-model = "whisper-1"             # Model name (provider-specific)
+provider = "whisper-rs"         # Transcription provider (see Providers section)
+model = "base.en"               # Model name (provider-specific)
 language = "en"                 # Language code (ISO 639-1)
-command_path = "/usr/bin/whisper"  # Custom CLI tool path (optional)
-model_path = "/path/to/model.bin"  # Custom model file path (optional)
-api_endpoint = "https://api.openai.com/v1/audio/transcriptions"  # Custom API endpoint (optional)
+keep_warm_for_secs = 300        # whisper-rs: unload the model after this much idle time
+audio_ctx = "auto"              # whisper-rs: shrink encoder context to clip length (big speedup for short clips)
+# initial_prompt = "Transcribe concise technical dictation."   # whisper-rs: bias decoding
+# coding_vocabulary = "Rust, Axum, Tokio"                      # whisper-rs: appended to the prompt
+# threads = 1                   # Local providers: decoding threads
+# beam_size = 1                 # Local providers: lower = faster
+# best_of = 1                   # Local providers: lower = faster
+# no_fallback = true            # whisper.cpp: faster, less robust on noisy audio
+# timeout_secs = 120            # whisper.cpp: kill a wedged transcription
+# command_path = "/usr/bin/whisper"  # CLI providers: custom tool path
+# model_path = "/path/to/model.bin"  # Custom model file path
+# api_key = "sk-your-api-key-here"   # openai-api only
+# api_endpoint = "https://api.openai.com/v1/audio/transcriptions"  # openai-api only
+
+[api]
+port = 3737                     # Local HTTP API port (toggle/start/stop/status)
+
+[injection]
+paste_threshold_chars = 120     # Short single-line text below this is typed directly
+restore_clipboard = true        # Restore previous clipboard after a paste injection
+# force_method = "type"         # Optional: always "type" or always "paste"
 
 [ui]
 indicator_position = "top-right"  # Visual indicator position
@@ -67,7 +82,7 @@ audio_feedback = true           # Play audio feedback sounds
 
 ### [audio] - Audio Input Settings
 
-Controls how ChezWizper captures audio from your microphone.
+Controls how smoltalk captures audio from your microphone.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -86,17 +101,34 @@ Configures speech-to-text transcription providers and models.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `provider` | string | auto-detect | Transcription provider: `"openai-api"`, `"openai-cli"`, `"whisper-cpp"`, or omit for auto-detection |
-| `api_key` | string | none | API key for API-based providers (required for openai-api) |
+| `provider` | string | auto-detect | Transcription provider: `"whisper-rs"`, `"whisper-cpp"`, `"openai-cli"`, `"openai-api"`, or omit for auto-detection |
 | `model` | string | `"base"` | Model name (provider-specific, see Providers section) |
 | `language` | string | `"en"` | Language code (ISO 639-1 format) |
-| `command_path` | string | auto-detect | Custom path to whisper CLI tool (optional) |
-| `model_path` | string | auto-detect | Custom path to model file (whisper.cpp only) |
-| `api_endpoint` | string | OpenAI API | Custom API endpoint URL (API providers only) |
+| `keep_warm_for_secs` | number | none | whisper-rs: unload the model after this much idle time (stays warm forever if unset) |
+| `audio_ctx` | string/number | `"auto"` | whisper-rs: `"auto"` shrinks the encoder context to the clip length; `0`/`"off"` uses the full 30s window; an integer sets it explicitly |
+| `initial_prompt` | string | none | whisper-rs: prompt to bias decoding (casing, punctuation, domain terms) |
+| `coding_vocabulary` | string | none | whisper-rs: comma-separated terms appended to the prompt |
+| `threads` | number | provider default | Local providers: decoding threads |
+| `beam_size` | number | provider default | Local providers: beam width (lower = faster) |
+| `best_of` | number | provider default | Local providers: candidate count (lower = faster) |
+| `no_fallback` | bool | `false` | whisper.cpp: disable temperature fallback (faster, less robust) |
+| `timeout_secs` | number | none | whisper.cpp: kill the subprocess after this long |
+| `command_path` | string | auto-detect | CLI providers: custom path to the whisper tool |
+| `model_path` | string | auto-detect | Custom path to the model file (whisper-rs / whisper.cpp) |
+| `api_key` | string | none | openai-api: API key (required) |
+| `api_endpoint` | string | OpenAI API | openai-api: custom endpoint URL |
 
 #### Providers
 
-ChezWizper supports multiple transcription providers:
+smoltalk supports multiple transcription providers:
+
+**whisper-rs** (`provider = "whisper-rs"`) — **recommended**
+- **Best for:** Lowest latency — this is smoltalk's reason to exist
+- **How it works:** Loads the model in-process once and keeps it warm; no subprocess spawn or model reload per utterance (measured stop-to-text p50 ~1.1s vs ~3.2s for the CLI path)
+- **Requirements:** A ggml model file (the installer's models work; prefers quantized variants like `ggml-base.en-q5_0.bin` when present)
+- **Models:** `"tiny.en"`, `"base.en"`, `"small.en"`, and multilingual equivalents
+- **Memory:** Model stays resident (~150 MB for base.en); use `keep_warm_for_secs` to unload when idle
+- **Note:** Not yet part of auto-detection — set it explicitly
 
 **OpenAI API** (`provider = "openai-api"`)
 - **Best for:** High accuracy, no local setup
@@ -118,10 +150,10 @@ ChezWizper supports multiple transcription providers:
 - **Cost:** Free (local processing)
 
 **Auto-Detection** (omit `provider`)
-- ChezWizper automatically selects the best available provider:
+- smoltalk automatically selects from the CLI providers:
   1. OpenAI Whisper CLI (if installed)
   2. whisper.cpp (fallback)
-- Note: API providers require explicit configuration with api_key
+- Note: `whisper-rs` (the fastest option) and API providers must be configured explicitly
 
 #### Language Codes
 
@@ -182,9 +214,25 @@ Configures integration with Wayland desktop environments.
 - `"wtype"` - Direct text typing (fast, works in most apps)
 - `"clipboard"` - Via clipboard (universal compatibility, slower)
 
+### [injection] - Hybrid Text Injection
+
+Controls how transcribed text lands in the focused application. Short single-line text is typed directly so your clipboard is never touched; longer or multiline text uses a guarded paste transaction (save clipboard → set transcript → paste → restore). See [Text Injection Setup](./text-injection-setup.md) for details.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `paste_threshold_chars` | number | `120` | Single-line text at or below this length is typed directly; anything longer (or containing a newline) is pasted |
+| `force_method` | string | none | Force `"type"` or `"paste"` for all text, bypassing the hybrid decision |
+| `restore_clipboard` | bool | `true` | Restore the previous clipboard contents after a paste injection. Best-effort for plain text; rich/image/clipboard-manager state cannot be perfectly preserved by wl-clipboard/X11 tools |
+
+### [api] - HTTP API
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `port` | number | `3737` | Local HTTP port for `/toggle`, `/start`, `/stop`, and `/status`. Change it to run a second instance (the benchmark harness uses 3838) |
+
 ### [behavior] - Application Behavior
 
-Controls how ChezWizper handles transcribed text and temporary files.
+Controls how smoltalk handles transcribed text and temporary files.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -195,7 +243,7 @@ Controls how ChezWizper handles transcribed text and temporary files.
 
 ## Configuration File Location
 
-ChezWizper looks for its configuration file at:
+smoltalk looks for its configuration file at:
 
 - **Linux:** `~/.config/chezwizper/config.toml`
 - **macOS:** `~/Library/Application Support/chezwizper/config.toml`
@@ -203,11 +251,12 @@ ChezWizper looks for its configuration file at:
 
 ## Environment Variables
 
-ChezWizper respects these environment variables:
+smoltalk respects these environment variables:
 
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Logging level (`error`, `warn`, `info`, `debug`, `trace`) |
+| `CHEZWIZPER_BENCH_TRACE` | Path to a JSONL file; when set, the daemon emits per-phase latency trace events (see [Benchmarking](./benchmarking.md)) |
 
 ## Common Configuration Scenarios
 
@@ -220,12 +269,13 @@ model = "whisper-1"
 language = "en"  # or "auto" for automatic detection
 ```
 
-### For Local Processing (Privacy-Focused)
+### For Local Processing (Privacy-Focused, Fastest)
 ```toml
 [whisper]
-provider = "openai-cli"
-model = "small"  # Good balance of speed and accuracy
+provider = "whisper-rs"
+model = "base.en"    # Loads once, stays warm; ~1.1s stop-to-text
 language = "en"
+audio_ctx = "auto"   # Shrink encoder work for short clips
 
 # No API key needed - everything runs locally
 ```
@@ -302,7 +352,7 @@ model = "whisper-1"
 - Verify boolean values: `true`/`false` not `"true"`/`"false"`
 
 **"Config file not found"**
-- ChezWizper will create a default config on first run
+- smoltalk will create a default config on first run
 - Manually create the config directory: `mkdir -p ~/.config/chezwizper`
 
 ### Provider Issues
@@ -327,7 +377,7 @@ model = "whisper-1"
 
 Test your configuration:
 ```bash
-# Start ChezWizper with verbose logging
+# Start smoltalk with verbose logging
 RUST_LOG=debug chezwizper
 
 # Look for these log messages:
@@ -335,4 +385,4 @@ RUST_LOG=debug chezwizper
 # "Using [Provider] for transcription"
 ```
 
-For more troubleshooting, see the [Whisper Transcription Setup](./whisper-transcription-setup.md) guide.
+For more troubleshooting, see the [Installation Guide](./installation.md) and [Text Injection Setup](./text-injection-setup.md).

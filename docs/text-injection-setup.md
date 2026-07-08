@@ -1,10 +1,20 @@
 # Text Injection Setup Guide
 
-ChezWizper supports multiple methods for automatically injecting transcribed text into your applications. This guide explains the available methods and how to set them up on different Linux distributions and desktop environments.
+smoltalk supports multiple methods for automatically injecting transcribed text into your applications. This guide explains the available methods and how to set them up on different Linux distributions and desktop environments.
+
+## Hybrid Injection
+
+smoltalk decides per-utterance how to deliver text, configured by the `[injection]` section (see the [Configuration Guide](./configuration.md)):
+
+- **Short, single-line text** (≤ `paste_threshold_chars`, default 120) is **typed directly** with the configured input tool. Your clipboard is never touched on this path.
+- **Long or multiline text** uses a **guarded paste transaction**: the current clipboard is saved, the transcript is set and pasted, and the previous clipboard is restored afterwards. If you copied something else mid-injection, the restore is skipped rather than clobbering it.
+- **Failures fall through, never vanish**: if direct typing fails, smoltalk falls back to paste; if paste fails, the transcript is left on the clipboard and the failure is logged.
+
+The clipboard restore is best-effort for plain text — wl-clipboard/X11 tools cannot perfectly preserve rich content, images, or clipboard-manager state.
 
 ## Automatic Method Selection
 
-ChezWizper automatically detects the best available text injection method based on:
+smoltalk automatically detects the best available text injection method based on:
 
 1. **User preference** (if specified in config)
 2. **Available tools** on your system  
@@ -54,7 +64,7 @@ input_method = "ydotool"
 
 **Best for**: Sway and some other Wayland compositors
 
-**Note**: Does NOT work reliably with KDE Plasma or GNOME due to security restrictions. ChezWizper will automatically fall back to clipboard paste if wtype fails.
+**Note**: Does NOT work reliably with KDE Plasma or GNOME due to security restrictions. smoltalk will automatically fall back to clipboard paste if wtype fails.
 
 **Installation**:
 ```bash
@@ -100,7 +110,7 @@ sudo apt install xclip xsel     # Ubuntu/Debian
 3. Simulates Ctrl+V keypress to paste using available tools (ydotool, wtype, or xdotool)
 4. If paste simulation fails, text remains in clipboard for manual paste
 
-**Note**: ChezWizper automatically falls back to this method if direct text injection (ydotool/wtype) fails.
+**Note**: smoltalk automatically falls back to this method if direct text injection (ydotool/wtype) fails.
 
 ## Distribution-Specific Notes
 
@@ -227,7 +237,7 @@ echo "Hello World" | wl-copy && wtype -M ctrl -P v -m ctrl -p v
 echo "Hello World" | wl-copy && wl-paste
 ```
 
-Run ChezWizper with verbose logging:
+Run smoltalk with verbose logging:
 ```bash
 ./chezwizper --verbose
 ```

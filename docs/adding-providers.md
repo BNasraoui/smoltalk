@@ -1,10 +1,10 @@
 # Adding New Transcription Providers
 
-This guide shows developers how to add new third-party transcription providers to ChezWizper. The provider architecture is designed to make this process straightforward and consistent.
+This guide shows developers how to add new third-party transcription providers to smoltalk. The provider architecture is designed to make this process straightforward and consistent.
 
 ## Overview
 
-ChezWizper uses a trait-based provider system where each transcription service implements the `TranscriptionProvider` trait. This allows for clean abstraction and easy extensibility.
+smoltalk uses a trait-based provider system where each transcription service implements the `TranscriptionProvider` trait. This allows for clean abstraction and easy extensibility.
 
 **Current providers:**
 - **OpenAI API** - Cloud-based OpenAI Whisper API
@@ -169,7 +169,7 @@ impl TranscriptionProvider for SuperSpeechProvider {
                 .client
                 .post(&self.endpoint)
                 .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("User-Agent", "ChezWizper/1.0")
+                .header("User-Agent", "smoltalk/1.0")
                 .multipart(form)
                 .send()
                 .await
@@ -420,7 +420,7 @@ language = "en"
 ```
 
 ```bash
-# Run ChezWizper and test recording
+# Run smoltalk and test recording
 cargo run
 ```
 

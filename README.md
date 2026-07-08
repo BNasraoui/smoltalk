@@ -1,32 +1,69 @@
-# ChezWizper
+# smoltalk
 
-Voice transcription tool for Wayland/Hyprland. Press a keybind to toggle recording, get automatic transcription via Whisper, and inject text into the focused application.
+A small voice dictation daemon for Wayland/Hyprland. Press a keybind (or hold a push-to-talk button), speak, and the transcription is typed into the focused application.
 
-📚 **[View Documentation](./docs/index.md)** - Detailed guides and configuration
+📚 **[View Documentation](./docs/index.md)** — detailed guides and configuration
+
+## Origins
+
+smoltalk is a fork of [ChezWizper](https://github.com/silvabyte/ChezWizper) by silvabyte. Upstream has deprecated ChezWizper in favor of [Audetic](https://github.com/silvabyte/Audetic), its actively maintained successor with a web UI, installer, and macOS support — if you want a fuller product, that's the place to go.
+
+smoltalk instead keeps the small single-daemon design and focuses on transcription latency, with changes verified by a bundled benchmark harness.
+
+> **Naming note:** the binary, systemd service, and config paths are still named `chezwizper` (e.g. `~/.config/chezwizper/config.toml`) while the rename is in progress. Docs refer to the project as smoltalk and to the artifacts by their current literal names.
+
+## Differences from upstream
+
+The upstream design spawns `whisper-cli` and reloads the model from disk for every utterance. smoltalk adds a `whisper-rs` provider that loads the model once and keeps it in memory (~150 MB for base.en). Measured with the bundled harness (30 phrases × 3 trials, same machine):
+
+| | whisper-cli subprocess | warm whisper-rs |
+|---|---|---|
+| Stop-to-text p50 | 3,163 ms | 1,108 ms |
+| Stop-to-text p95 | 5,300 ms | 1,280 ms |
+| Model load | every utterance | once |
+
+Other changes since the fork:
+
+- Explicit `POST /start` / `POST /stop` endpoints for push-to-talk (bind press/release on a key or mouse button), alongside the original `/toggle`
+- Hybrid text injection: short single-line text is typed directly without touching the clipboard; long or multiline text uses a paste transaction that restores the previous clipboard afterwards
+- Latency trace instrumentation (`CHEZWIZPER_BENCH_TRACE`) and a benchmark harness under `bench/`
+- Configurable API port (`[api] port`), so a benchmark instance can run alongside the live service
+
+## Features
+
+- Keybind toggle and push-to-talk recording
+- Local transcription via whisper-rs (warm, in-process); whisper.cpp CLI, OpenAI CLI, and OpenAI API providers also available
+- Text injection with clipboard preservation
+- Visual recording indicators and Waybar integration
+- Single TOML config
 
 ## Quick Install (Omarchy + Arch Linux)
 
 ```bash
-git clone https://github.com/silvabyte/ChezWizper.git
-cd ChezWizper
+git clone https://github.com/BNasraoui/smoltalk.git
+cd smoltalk
 make install
 ```
 
-This automatically installs dependencies, builds ChezWizper with optimized Whisper, sets up services, and configures keybinds.
+This installs dependencies, builds with optimized Whisper, sets up services, and configures keybinds.
 
 **After installation:**
 1. Start the service: `make start`
-2. Add to Hyprland config: `bindd = SUPER, R, ChezWizper, exec, curl -X POST http://127.0.0.1:3737/toggle`
-3. Press Super+R to start recording!
+2. Toggle mode — add to your Hyprland config:
+   `bindd = SUPER, R, smoltalk, exec, curl -X POST http://127.0.0.1:3737/toggle`
+3. Or push-to-talk — bind press to `/start` and release to `/stop`:
+   ```
+   bindd  = , mouse:276, smoltalk start, exec, curl -fsS -X POST http://127.0.0.1:3737/start
+   bindrd = , mouse:276, smoltalk stop,  exec, curl -fsS -X POST http://127.0.0.1:3737/stop
+   ```
 
-## Features
+For the warm provider, set in `~/.config/chezwizper/config.toml`:
 
-- 🎤 Keybind-activated voice recording
-- 🔴 Visual recording indicators  
-- 🎯 Automatic text injection into focused apps
-- 📋 Intelligent clipboard fallback
-- ⚡ Optimized for Wayland/Hyprland
-- 🔧 Configurable via TOML
+```toml
+[whisper]
+provider = "whisper-rs"
+model = "base.en"
+```
 
 ## Manual Installation
 
@@ -34,11 +71,13 @@ For other distributions or custom setups, see the [Installation Guide](./docs/in
 
 ## Configuration
 
-Default config at `~/.config/chezwizper/config.toml`. See [Configuration Guide](./docs/configuration.md) for details.
+Default config at `~/.config/chezwizper/config.toml`. See the [Configuration Guide](./docs/configuration.md) for the full reference, including the `[injection]` and `[api]` sections.
+
+## Benchmarking
+
+The daemon emits per-phase JSONL trace events when `CHEZWIZPER_BENCH_TRACE` is set, and `bench/` contains scripts that play a phrase corpus through a PipeWire loopback into a scratch daemon and report per-phase latency, RTF, and memory. See [Benchmarking](./docs/benchmarking.md).
 
 ## Development
-
-ChezWizper uses a Makefile for common tasks:
 
 ```bash
 make build      # Build debug binary
@@ -57,17 +96,13 @@ make clean      # Clean build artifacts
 
 ## Troubleshooting
 
-- **Recording issues**: Check [Configuration Guide](./docs/configuration.md)
+- **Recording issues**: Check the [Configuration Guide](./docs/configuration.md)
 - **Text injection fails**: See [Text Injection Setup](./docs/text-injection-setup.md)
 - **Service problems**: View logs with `make logs`
 
-## Updates
+## Credits
 
-```bash
-chezwizper-update                    # Update ChezWizper
-chezwizper-update --whisper          # Update both ChezWizper and Whisper
-chezwizper-update --check            # Check for updates
-```
+smoltalk began as [ChezWizper](https://github.com/silvabyte/ChezWizper) by [silvabyte](https://github.com/silvabyte). Their current project, [Audetic](https://github.com/silvabyte/Audetic), continues that codebase as a full-featured product and is worth a look.
 
 ## License
 
