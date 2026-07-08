@@ -395,10 +395,30 @@ class PlaybackAudioSource(AudioSource):
             "it is restored on exit",
             file=sys.stderr,
         )
+        self._install_cleanup_handlers()
         return self
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
+    def _install_cleanup_handlers(self):
+        # A SIGTERM/SIGINT mid-run must still restore the user's default
+        # source and unload the sink — otherwise every new recording stream
+        # on the system (including live dictation) hears bench silence.
+        import atexit
+
+        atexit.register(self.close)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous = signal.getsignal(signum)
+
+            def handler(sig, frame, previous=previous):
+                self.close()
+                if callable(previous):
+                    previous(sig, frame)
+                else:
+                    raise SystemExit(128 + sig)
+
+            signal.signal(signum, handler)
 
     def daemon_env(self):
         return {"PULSE_SOURCE": f"{self.sink_name}.monitor"}
