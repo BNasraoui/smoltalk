@@ -35,12 +35,34 @@ pub enum RecordedAudio {
     NoSpeech,
 }
 
+/// Resolve the configured `[audio] device` name to a cpal input device.
+/// An unknown name warns and falls back to the system default rather than
+/// failing: dictation must keep working after a device disappears.
+fn select_input_device(host: &cpal::Host, device_name: &str) -> Result<cpal::Device> {
+    if device_name != "default" {
+        match host.input_devices() {
+            Ok(mut devices) => {
+                if let Some(device) =
+                    devices.find(|d| d.name().map(|n| n == device_name).unwrap_or(false))
+                {
+                    return Ok(device);
+                }
+                tracing::warn!(
+                    "Configured audio device \"{device_name}\" not found; falling back to default input"
+                );
+            }
+            Err(e) => tracing::warn!("Could not enumerate input devices: {e}; using default"),
+        }
+    }
+
+    host.default_input_device()
+        .context("No input device available")
+}
+
 impl AudioStreamManager {
-    pub fn new_with_vad(vad_settings: VadSettings) -> Result<Self> {
+    pub fn new_with_vad(device_name: &str, vad_settings: VadSettings) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("No input device available")?;
+        let device = select_input_device(&host, device_name)?;
 
         info!("Using audio device: {}", device.name()?);
 
@@ -278,7 +300,7 @@ mod tests {
         }
 
         // This test may fail in CI without audio devices
-        let _manager = AudioStreamManager::new_with_vad(VadSettings::default());
+        let _manager = AudioStreamManager::new_with_vad("default", VadSettings::default());
     }
 
     #[test]

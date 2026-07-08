@@ -66,7 +66,8 @@ async fn main() -> Result<()> {
     // Initialize components
     let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);
 
-    let audio_recorder = AudioStreamManager::new_with_vad(config.vad.clone())?;
+    let audio_recorder =
+        AudioStreamManager::new_with_vad(&config.audio.device, config.vad.clone())?;
 
     // Build whisper transcriber
     let whisper = if let Some(provider) = &config.whisper.provider {

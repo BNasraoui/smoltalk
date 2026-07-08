@@ -355,10 +355,11 @@ class PlaybackAudioSource(AudioSource):
         self.rate = rate
         self.tail_padding_ms = tail_padding_ms
         self.module_id = None
+        self.previous_default_source = None
 
     @classmethod
     def available(cls):
-        return all(shutil.which(command) for command in ("pactl", "paplay", "pw-record"))
+        return all(shutil.which(command) for command in ("pactl", "paplay", "parecord"))
 
     def __enter__(self):
         proc = subprocess.run(
@@ -370,6 +371,30 @@ class PlaybackAudioSource(AudioSource):
             detail = (proc.stderr or proc.stdout or "unknown pactl error").strip()
             raise RuntimeError(f"failed to create Pulse/PipeWire null sink: {detail}")
         self.module_id = proc.stdout.strip()
+        # Force unity gain end to end: an attenuated sink/monitor feeds the
+        # daemon quiet audio, which degrades both VAD and WER measurements.
+        subprocess.run(["pactl", "set-sink-volume", self.sink_name, "100%"], check=False)
+        subprocess.run(
+            ["pactl", "set-source-volume", f"{self.sink_name}.monitor", "100%"], check=False
+        )
+        subprocess.run(["pactl", "set-sink-mute", self.sink_name, "0"], check=False)
+        # The daemon records via cpal's ALSA default, which on PipeWire systems
+        # follows the DEFAULT SOURCE and ignores PULSE_SOURCE. Flip the default
+        # source to the bench monitor for the run and restore it afterwards.
+        # (Consequence: any OTHER app starting a recording during the run also
+        # hears the bench audio — don't dictate while a benchmark is running.)
+        got = subprocess.run(
+            ["pactl", "get-default-source"], capture_output=True, text=True, check=False
+        )
+        self.previous_default_source = got.stdout.strip() or None
+        subprocess.run(
+            ["pactl", "set-default-source", f"{self.sink_name}.monitor"], check=True
+        )
+        print(
+            "note: default audio source redirected to the bench sink for this run; "
+            "it is restored on exit",
+            file=sys.stderr,
+        )
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -379,11 +404,18 @@ class PlaybackAudioSource(AudioSource):
         return {"PULSE_SOURCE": f"{self.sink_name}.monitor"}
 
     def verify(self):
+        # parecord targets the monitor explicitly; pw-record must NOT be used
+        # here — it ignores PULSE_SOURCE and silently records the microphone.
         with tempfile.NamedTemporaryFile(suffix=".wav") as capture, tempfile.NamedTemporaryFile(suffix=".wav") as tone:
             self._write_tone(Path(tone.name))
             recorder = subprocess.Popen(
-                ["pw-record", "--rate", str(self.rate), "--channels", "1", capture.name],
-                env={**os.environ, **self.daemon_env()},
+                [
+                    "parecord",
+                    f"--device={self.sink_name}.monitor",
+                    f"--rate={self.rate}",
+                    "--channels=1",
+                    capture.name,
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -407,6 +439,11 @@ class PlaybackAudioSource(AudioSource):
         time.sleep(self.tail_padding_ms / 1000.0)
 
     def close(self):
+        if getattr(self, "previous_default_source", None):
+            subprocess.run(
+                ["pactl", "set-default-source", self.previous_default_source], check=False
+            )
+            self.previous_default_source = None
         if self.module_id:
             subprocess.run(["pactl", "unload-module", self.module_id], check=False)
             self.module_id = None

@@ -21,7 +21,11 @@ pub enum VadEngine {
 pub struct VadSettings {
     pub enabled: bool,
     pub engine: VadEngine,
+    /// Amplitude gate threshold (peak/RMS level, 0.0-1.0).
     pub threshold: f32,
+    /// Silero speech-probability threshold (0.0-1.0) — a different scale
+    /// from the amplitude `threshold`.
+    pub silero_threshold: f32,
     pub min_speech_ms: u32,
     pub pad_ms: u32,
     pub model_path: Option<PathBuf>,
@@ -33,6 +37,7 @@ impl Default for VadSettings {
             enabled: true,
             engine: VadEngine::Auto,
             threshold: 0.02,
+            silero_threshold: 0.5,
             min_speech_ms: 100,
             pad_ms: 200,
             model_path: None,
@@ -169,7 +174,7 @@ fn trim_with_silero(
     context: &Mutex<WhisperVadContext>,
 ) -> anyhow::Result<TrimResult> {
     let mut params = WhisperVadParams::new();
-    params.set_threshold(settings.threshold.clamp(0.0, 1.0));
+    params.set_threshold(settings.silero_threshold.clamp(0.0, 1.0));
     params.set_min_speech_duration(settings.min_speech_ms as i32);
     params.set_speech_pad(settings.pad_ms as i32);
 
@@ -294,12 +299,8 @@ mod tests {
 
     fn cfg() -> VadSettings {
         VadSettings {
-            enabled: true,
             engine: VadEngine::Amplitude,
-            threshold: 0.02,
-            min_speech_ms: 100,
-            pad_ms: 200,
-            model_path: None,
+            ..Default::default()
         }
     }
 

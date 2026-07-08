@@ -54,6 +54,9 @@ threshold = 0.02
 min_speech_ms = 100
 # Keep padding around detected speech so word starts/endings are not clipped.
 pad_ms = 200
+# Silero speech-probability threshold (0.0-1.0) — a separate scale from the
+# amplitude `threshold` above. Lower keeps quieter/uncertain speech.
+# silero_threshold = 0.5
 # Optional Silero model override. The tiny for-tests model can exercise the path,
 # but normal auto-detection expects ggml-silero-v5.1.2.bin (from download-vad-model.sh).
 # model_path = "/home/you/.local/share/chezwizper/whisper/models/ggml-silero-v5.1.2.bin"
