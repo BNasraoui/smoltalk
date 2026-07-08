@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::info;
 
+pub use crate::vad::VadSettings;
 use crate::whisper::AudioCtxConfig;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -10,6 +11,7 @@ use crate::whisper::AudioCtxConfig;
 pub struct Config {
     pub audio: AudioConfig,
     pub whisper: WhisperConfig,
+    pub vad: VadSettings,
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
@@ -259,6 +261,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vad::VadEngine;
 
     #[test]
     fn api_port_defaults_when_section_is_missing() {
@@ -296,5 +299,32 @@ mod tests {
             Some(InjectionForceMethod::Paste)
         );
         assert!(!config.injection.restore_clipboard);
+    }
+
+    #[test]
+    fn vad_defaults_when_section_is_missing() {
+        let config: Config = toml::from_str("[audio]\ndevice = \"default\"\n").unwrap();
+
+        assert!(config.vad.enabled);
+        assert_eq!(config.vad.engine, VadEngine::Auto);
+        assert_eq!(config.vad.threshold, 0.02);
+        assert_eq!(config.vad.min_speech_ms, 100);
+        assert_eq!(config.vad.pad_ms, 200);
+        assert_eq!(config.vad.model_path, None);
+    }
+
+    #[test]
+    fn vad_honors_explicit_values() {
+        let config: Config = toml::from_str(
+            "[vad]\nenabled = false\nengine = \"amplitude\"\nthreshold = 0.04\nmin_speech_ms = 250\npad_ms = 150\nmodel_path = \"/tmp/vad.bin\"\n",
+        )
+        .unwrap();
+
+        assert!(!config.vad.enabled);
+        assert_eq!(config.vad.engine, VadEngine::Amplitude);
+        assert_eq!(config.vad.threshold, 0.04);
+        assert_eq!(config.vad.min_speech_ms, 250);
+        assert_eq!(config.vad.pad_ms, 150);
+        assert_eq!(config.vad.model_path, Some(PathBuf::from("/tmp/vad.bin")));
     }
 }

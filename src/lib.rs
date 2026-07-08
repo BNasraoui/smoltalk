@@ -7,4 +7,5 @@ pub mod normalizer;
 pub mod text_injection;
 pub mod transcription;
 pub mod ui;
+pub mod vad;
 pub mod whisper;

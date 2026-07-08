@@ -8,6 +8,7 @@ mod normalizer;
 mod text_injection;
 mod transcription;
 mod ui;
+mod vad;
 mod whisper;
 
 use anyhow::Result;
@@ -19,7 +20,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::api::{ApiCommand, ApiServer, AppStatus};
-use crate::audio::AudioStreamManager;
+use crate::audio::{AudioStreamManager, RecordedAudio};
 use crate::config::Config;
 use crate::text_injection::TextInjector;
 use crate::transcription::TranscriptionService;
@@ -70,7 +71,7 @@ async fn main() -> Result<()> {
     // Initialize components
     let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);
 
-    let audio_recorder = AudioStreamManager::new()?;
+    let audio_recorder = AudioStreamManager::new_with_vad(config.vad.clone())?;
 
     // Build whisper transcriber
     let whisper = if let Some(provider) = &config.whisper.provider {
@@ -221,14 +222,14 @@ async fn main() -> Result<()> {
                     };
 
                     match stop_result {
-                        Ok(_) => {
+                        Ok(RecordedAudio::Speech(audio_path)) => {
                             // Show processing indicator
                             if let Err(e) = indicator.show_processing().await {
                                 error!("Failed to show processing indicator: {}", e);
                             }
 
                             // Transcribe audio
-                            match transcription_service.transcribe(&temp_path).await {
+                            match transcription_service.transcribe(&audio_path).await {
                                 Ok(text) => {
                                     if !text.is_empty() {
                                         info!("Transcription successful: {} chars", text.len());
@@ -268,8 +269,16 @@ async fn main() -> Result<()> {
 
                             // Clean up audio file
                             if config.behavior.delete_audio_files {
-                                let _ = std::fs::remove_file(&temp_path);
+                                let _ = std::fs::remove_file(&audio_path);
                             }
+                        }
+                        Ok(RecordedAudio::NoSpeech) => {
+                            bench_trace::event_with_extra("transcription_skipped", || {
+                                serde_json::json!({
+                                    "reason": "no_speech",
+                                })
+                            });
+                            let _ = indicator.show_error("No speech detected").await;
                         }
                         Err(e) => {
                             error!("Failed to stop recording: {}", e);

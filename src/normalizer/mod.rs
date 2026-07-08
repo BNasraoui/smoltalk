@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::OnceLock;
 use tracing::{debug, info};
 
 /// Trait for normalizing transcription output from various whisper implementations
@@ -46,7 +47,7 @@ impl TranscriptionNormalizer for WhisperCppNormalizer {
             }
         }
 
-        let result = cleaned.trim().to_string();
+        let result = strip_non_speech_markers(&cleaned);
         debug!(
             "Normalized {} chars to {} chars",
             raw_output.len(),
@@ -79,13 +80,46 @@ impl OpenAIWhisperNormalizer {
 impl TranscriptionNormalizer for OpenAIWhisperNormalizer {
     fn normalize(&self, raw_output: &str) -> String {
         // OpenAI Whisper typically outputs clean text without timestamps
-        // Just trim whitespace
-        raw_output.trim().to_string()
+        // Just trim whitespace and remove non-speech markers.
+        strip_non_speech_markers(raw_output)
     }
 
     fn name(&self) -> &'static str {
         "OpenAIWhisperNormalizer"
     }
+}
+
+fn strip_non_speech_markers(text: &str) -> String {
+    static MARKER_REGEX: OnceLock<Regex> = OnceLock::new();
+    static WHITESPACE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+    let marker_regex = MARKER_REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?ix)
+            (?:
+                \[
+                    \s*
+                    (?:blank_audio|silence|silent|no \s+ speech|inaudible|music|noise|background \s+ noise)
+                    \s*
+                \]
+                |
+                \(
+                    \s*
+                    (?:blank_audio|silence|silent|no \s+ speech|inaudible|music|noise|background \s+ noise)
+                    \s*
+                \)
+            )",
+        )
+        .expect("non-speech marker regex is valid")
+    });
+    let whitespace_regex =
+        WHITESPACE_REGEX.get_or_init(|| Regex::new(r"\s+").expect("whitespace regex is valid"));
+
+    let stripped = marker_regex.replace_all(text, " ");
+    whitespace_regex
+        .replace_all(stripped.trim(), " ")
+        .trim()
+        .to_string()
 }
 
 /// Enum to hold different normalizer types
@@ -153,5 +187,22 @@ mod tests {
         let expected = "This is clean text";
 
         assert_eq!(normalizer.normalize(input), expected);
+    }
+
+    #[test]
+    fn non_speech_markers_only_normalize_to_empty_text() {
+        let normalizer = OpenAIWhisperNormalizer::new();
+
+        assert_eq!(normalizer.normalize(" [BLANK_AUDIO] "), "");
+        assert_eq!(normalizer.normalize(" [silence]\n(silence) "), "");
+    }
+
+    #[test]
+    fn non_speech_markers_are_stripped_from_real_text() {
+        let normalizer = WhisperCppNormalizer::new().unwrap();
+
+        let input = "[00:00:00.000 --> 00:00:03.280] hello [BLANK_AUDIO] world (silence)";
+
+        assert_eq!(normalizer.normalize(input), "hello world");
     }
 }

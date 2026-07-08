@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
 
 use crate::bench_trace;
+use crate::vad::{VadOutput, VadProcessor, VadSettings};
 
 /// State of the audio recording session
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,11 +27,16 @@ pub struct AudioStreamManager {
     active_stream: Arc<Mutex<Option<cpal::Stream>>>,
     state: Arc<Mutex<RecordingState>>,
     first_sample_seen: Arc<AtomicBool>,
+    vad: VadProcessor,
+}
+
+pub enum RecordedAudio {
+    Speech(PathBuf),
+    NoSpeech,
 }
 
 impl AudioStreamManager {
-    /// Create a new audio stream manager
-    pub fn new() -> Result<Self> {
+    pub fn new_with_vad(vad_settings: VadSettings) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -44,6 +50,7 @@ impl AudioStreamManager {
             sample_rate: cpal::SampleRate(16000), // Whisper optimal
             buffer_size: cpal::BufferSize::Default,
         };
+        let sample_rate = config.sample_rate.0;
 
         Ok(Self {
             device,
@@ -52,6 +59,7 @@ impl AudioStreamManager {
             active_stream: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(RecordingState::Idle)),
             first_sample_seen: Arc::new(AtomicBool::new(false)),
+            vad: VadProcessor::new(vad_settings, sample_rate),
         })
     }
 
@@ -117,7 +125,7 @@ impl AudioStreamManager {
     }
 
     /// Stop recording and save audio to file
-    pub async fn stop_recording(&self, output_path: PathBuf) -> Result<PathBuf> {
+    pub async fn stop_recording(&self, output_path: PathBuf) -> Result<RecordedAudio> {
         bench_trace::event_with_extra("audio_stop_begin", || {
             serde_json::json!({
                 "output_path": output_path.display().to_string(),
@@ -163,14 +171,22 @@ impl AudioStreamManager {
 
         info!("Stopping recording, {} samples captured", samples.len());
 
-        let write_result = write_samples_to_wav(&output_path, &samples);
+        let vad_output = self.vad.process(samples);
+        trace_vad_output(&vad_output);
+        if vad_output.skipped {
+            *self.state.lock().unwrap() = RecordingState::Idle;
+            info!("VAD detected no speech; skipping WAV write and transcription");
+            return Ok(RecordedAudio::NoSpeech);
+        }
+
+        let write_result = write_samples_to_wav(&output_path, &vad_output.samples);
 
         *self.state.lock().unwrap() = RecordingState::Idle;
 
         write_result?;
 
         info!("Audio saved to: {:?}", output_path);
-        Ok(output_path)
+        Ok(RecordedAudio::Speech(output_path))
     }
 
     /// Cleanup any active stream
@@ -183,6 +199,17 @@ impl AudioStreamManager {
             bench_trace::event("audio_stream_dropped");
         }
     }
+}
+
+fn trace_vad_output(output: &VadOutput) {
+    bench_trace::event_with_extra("vad_trim_done", || {
+        serde_json::json!({
+            "engine": output.engine,
+            "input_samples": output.input_samples,
+            "output_samples": output.output_samples,
+            "skipped": output.skipped,
+        })
+    });
 }
 
 fn take_samples(samples: &Arc<Mutex<Vec<f32>>>) -> Vec<f32> {
@@ -251,7 +278,7 @@ mod tests {
         }
 
         // This test may fail in CI without audio devices
-        let _manager = AudioStreamManager::new();
+        let _manager = AudioStreamManager::new_with_vad(VadSettings::default());
     }
 
     #[test]

@@ -41,6 +41,23 @@ language = "en"             # Language code (en, es, fr, de, etc.)
 # model = "whisper-1"                    # API model name
 # api_endpoint = "https://api.openai.com/v1/audio/transcriptions"  # Optional
 
+[vad]
+# VAD runs after PTT release and before the WAV is written. It never stops a
+# recording early; it only trims leading/trailing silence or skips no-speech clips.
+enabled = true
+# auto = use Silero when a real model is installed, otherwise amplitude fallback.
+# Valid values: "auto", "silero", "amplitude"
+engine = "auto"
+# Amplitude fallback threshold. Raise to reject more background noise; lower for quiet speech.
+threshold = 0.02
+# Ignore shorter bursts as noise.
+min_speech_ms = 100
+# Keep padding around detected speech so word starts/endings are not clipped.
+pad_ms = 200
+# Optional Silero model override. The tiny for-tests model can exercise the path,
+# but normal auto-detection expects ggml-silero-v5.1.2.bin (from download-vad-model.sh).
+# model_path = "/home/you/.local/share/chezwizper/whisper/models/ggml-silero-v5.1.2.bin"
+
 [ui]
 indicator_position = "top-right"
 indicator_size = 20
