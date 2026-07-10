@@ -25,7 +25,7 @@ The upstream design spawns `whisper-cli` and reloads the model from disk for eve
 Other changes since the fork:
 
 - Explicit `POST /start` / `POST /stop` endpoints for push-to-talk (bind press/release on a key or mouse button), alongside the original `/toggle`
-- Hybrid text injection: short single-line text is typed directly without touching the clipboard; long or multiline text uses a paste transaction that restores the previous clipboard afterwards
+- Hybrid text injection: single-line text is typed directly without touching the clipboard; multiline text uses a paste transaction that restores the previous clipboard afterwards
 - Latency trace instrumentation (`CHEZWIZPER_BENCH_TRACE`) and a benchmark harness under `bench/`
 - Configurable API port (`[api] port`), so a benchmark instance can run alongside the live service
 

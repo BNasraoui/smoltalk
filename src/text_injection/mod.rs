@@ -121,7 +121,6 @@ impl TextInjector {
                 "method": plan.name(),
                 "text_chars": text.chars().count(),
                 "has_newline": text_contains_newline(text),
-                "threshold": self.settings.paste_threshold_chars,
                 "forced": self.settings.force_method.map(force_method_name),
             })
         });
@@ -461,7 +460,6 @@ fn choose_injection_plan(text: &str, settings: &InjectionConfig) -> InjectionPla
         Some(InjectionForceMethod::Type) => InjectionPlan::Type,
         Some(InjectionForceMethod::Paste) => InjectionPlan::Paste,
         None if text_contains_newline(text) => InjectionPlan::Paste,
-        None if text.chars().count() > settings.paste_threshold_chars => InjectionPlan::Paste,
         None => InjectionPlan::Type,
     }
 }
@@ -536,7 +534,6 @@ mod tests {
 
     fn settings() -> InjectionConfig {
         InjectionConfig {
-            paste_threshold_chars: 10,
             force_method: None,
             restore_clipboard: true,
         }
@@ -599,10 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn decision_uses_paste_above_threshold_or_for_multiline() {
+    fn decision_uses_type_for_long_single_line_text_and_paste_for_multiline() {
         assert_eq!(
             choose_injection_plan("this is too long", &settings()),
-            InjectionPlan::Paste
+            InjectionPlan::Type
         );
         assert_eq!(
             choose_injection_plan("line one\nline two", &settings()),
@@ -627,7 +624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_type_path_never_invokes_clipboard_commands() {
+    async fn single_line_type_path_never_invokes_clipboard_commands() {
         let _guard = test_env_lock().await;
         let dir = unique_test_dir("short-type");
         fs::create_dir_all(&dir).unwrap();
@@ -648,17 +645,21 @@ mod tests {
 
         let injector = TextInjector::new(Some("wtype"), settings()).unwrap();
         injector.inject_text("hello").await.unwrap();
+        injector.inject_text("this is too long").await.unwrap();
         injector.inject_text("again").await.unwrap();
 
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         }
 
-        assert_eq!(fs::read_to_string(log).unwrap(), "type:hello\ntype:again\n");
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "type:hello\ntype:this is too long\ntype:again\n"
+        );
     }
 
     #[tokio::test]
-    async fn long_paste_path_copies_pastes_then_restores_clipboard() {
+    async fn forced_paste_path_copies_pastes_then_restores_clipboard() {
         let _guard = test_env_lock().await;
         let dir = unique_test_dir("long-paste");
         fs::create_dir_all(&dir).unwrap();
@@ -679,7 +680,9 @@ mod tests {
         let old_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", prepend_path(&dir));
 
-        let injector = TextInjector::new(Some("wtype"), settings()).unwrap();
+        let mut config = settings();
+        config.force_method = Some(InjectionForceMethod::Paste);
+        let injector = TextInjector::new(Some("wtype"), config).unwrap();
         injector.inject_text("this is too long").await.unwrap();
 
         if let Some(path) = old_path {
@@ -694,7 +697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_paste_remains_available_to_a_delayed_clipboard_consumer() {
+    async fn paste_remains_available_to_a_delayed_clipboard_consumer() {
         let _guard = test_env_lock().await;
         let dir = unique_test_dir("delayed-paste-consumer");
         fs::create_dir_all(&dir).unwrap();
@@ -716,7 +719,9 @@ mod tests {
         let old_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", prepend_path(&dir));
 
-        let injector = TextInjector::new(Some("wtype"), settings()).unwrap();
+        let mut config = settings();
+        config.force_method = Some(InjectionForceMethod::Paste);
+        let injector = TextInjector::new(Some("wtype"), config).unwrap();
         injector.inject_text("this is too long").await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -728,7 +733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_paste_skips_restore_when_clipboard_changes_during_injection() {
+    async fn paste_skips_restore_when_clipboard_changes_during_injection() {
         let _guard = test_env_lock().await;
         let dir = unique_test_dir("user-copy");
         fs::create_dir_all(&dir).unwrap();
@@ -749,7 +754,9 @@ mod tests {
         let old_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", prepend_path(&dir));
 
-        let injector = TextInjector::new(Some("wtype"), settings()).unwrap();
+        let mut config = settings();
+        config.force_method = Some(InjectionForceMethod::Paste);
+        let injector = TextInjector::new(Some("wtype"), config).unwrap();
         injector.inject_text("this is too long").await.unwrap();
 
         if let Some(path) = old_path {

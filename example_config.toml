@@ -96,9 +96,8 @@ input_method = "wtype"
 use_hyprland_ipc = true
 
 [injection]
-# Short single-line text is typed directly so the clipboard is not touched.
-# Longer or multiline text uses a guarded paste transaction.
-paste_threshold_chars = 120
+# Single-line text is typed directly so application-specific paste shortcuts
+# cannot swallow a transcript. Multiline text uses a guarded paste transaction.
 # Optional: force_method = "type" or "paste"
 # force_method = "paste"
 # Restore is best-effort for plain text; wl-clipboard/X11 tools cannot perfectly

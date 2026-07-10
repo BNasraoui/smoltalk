@@ -116,7 +116,6 @@ fn default_audio_feedback() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InjectionConfig {
-    pub paste_threshold_chars: usize,
     pub force_method: Option<InjectionForceMethod>,
     pub restore_clipboard: bool,
 }
@@ -225,7 +224,6 @@ impl Default for BehaviorConfig {
 impl Default for InjectionConfig {
     fn default() -> Self {
         Self {
-            paste_threshold_chars: 120,
             force_method: None,
             restore_clipboard: true,
         }
@@ -302,19 +300,16 @@ mod tests {
     fn injection_defaults_when_section_is_missing() {
         let config: Config = toml::from_str("[audio]\ndevice = \"default\"\n").unwrap();
 
-        assert_eq!(config.injection.paste_threshold_chars, 120);
         assert_eq!(config.injection.force_method, None);
         assert!(config.injection.restore_clipboard);
     }
 
     #[test]
     fn injection_honors_explicit_values() {
-        let config: Config = toml::from_str(
-            "[injection]\npaste_threshold_chars = 42\nforce_method = \"paste\"\nrestore_clipboard = false\n",
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str("[injection]\nforce_method = \"paste\"\nrestore_clipboard = false\n")
+                .unwrap();
 
-        assert_eq!(config.injection.paste_threshold_chars, 42);
         assert_eq!(
             config.injection.force_method,
             Some(InjectionForceMethod::Paste)

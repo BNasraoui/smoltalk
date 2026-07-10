@@ -48,7 +48,6 @@ audio_ctx = "auto"              # whisper-rs: shrink encoder context to clip len
 port = 3737                     # Local HTTP API port (toggle/start/stop/status)
 
 [injection]
-paste_threshold_chars = 120     # Short single-line text below this is typed directly
 restore_clipboard = true        # Restore previous clipboard after a paste injection
 # force_method = "type"         # Optional: always "type" or always "paste"
 
@@ -222,11 +221,10 @@ Configures integration with Wayland desktop environments.
 
 ### [injection] - Hybrid Text Injection
 
-Controls how transcribed text lands in the focused application. Short single-line text is typed directly so your clipboard is never touched; longer or multiline text uses a guarded paste transaction (save clipboard → set transcript → paste → restore). See [Text Injection Setup](./text-injection-setup.md) for details.
+Controls how transcribed text lands in the focused application. Single-line text is typed directly regardless of length so your clipboard is never touched and application-specific paste shortcuts cannot swallow it. Multiline text uses a guarded paste transaction (save clipboard → set transcript → paste → restore). See [Text Injection Setup](./text-injection-setup.md) for details.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `paste_threshold_chars` | number | `120` | Single-line text at or below this length is typed directly; anything longer (or containing a newline) is pasted |
 | `force_method` | string | none | Force `"type"` or `"paste"` for all text, bypassing the hybrid decision |
 | `restore_clipboard` | bool | `true` | Restore the previous clipboard contents after a paste injection. Best-effort for plain text; rich/image/clipboard-manager state cannot be perfectly preserved by wl-clipboard/X11 tools |
 

@@ -6,8 +6,8 @@ smoltalk supports multiple methods for automatically injecting transcribed text 
 
 smoltalk decides per-utterance how to deliver text, configured by the `[injection]` section (see the [Configuration Guide](./configuration.md)):
 
-- **Short, single-line text** (≤ `paste_threshold_chars`, default 120) is **typed directly** with the configured input tool. Your clipboard is never touched on this path.
-- **Long or multiline text** uses a **guarded paste transaction**: the current clipboard is saved, the transcript is set and pasted, and the previous clipboard is restored afterwards. If you copied something else mid-injection, the restore is skipped rather than clobbering it.
+- **Single-line text** is **typed directly** with the configured input tool, regardless of length. Your clipboard is never touched, and terminal-specific paste shortcuts cannot swallow the transcript.
+- **Multiline text** uses a **guarded paste transaction**: the current clipboard is saved, the transcript is set and pasted, and the previous clipboard is restored afterwards. If you copied something else mid-injection, the restore is skipped rather than clobbering it.
 - **Failures fall through, never vanish**: if direct typing fails, smoltalk falls back to paste; if paste fails, the transcript is left on the clipboard and the failure is logged.
 
 The clipboard restore is best-effort for plain text — wl-clipboard/X11 tools cannot perfectly preserve rich content, images, or clipboard-manager state.
