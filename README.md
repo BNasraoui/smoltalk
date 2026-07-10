@@ -33,6 +33,7 @@ Other changes since the fork:
 
 - Keybind toggle and push-to-talk recording
 - Local transcription via whisper-rs (in-process and cold while idle by default); whisper.cpp CLI, OpenAI CLI, and OpenAI API providers also available
+- Memory-conscious by default: prepares the model while you speak, then releases its inference state after each recording
 - Text injection with clipboard preservation
 - Visual recording indicators and Waybar integration
 - Single TOML config
