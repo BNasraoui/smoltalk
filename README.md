@@ -14,7 +14,7 @@ smoltalk instead keeps the small single-daemon design and focuses on transcripti
 
 ## Differences from upstream
 
-The upstream design spawns `whisper-cli` and reloads the model from disk for every utterance. smoltalk adds an in-process `whisper-rs` provider. By default it starts capture first, prepares the model while you speak, and releases its roughly 166 MiB incremental memory when the recording finishes. Positive `keep_warm_for_secs` values retain the model between recordings. With retention enabled, the bundled harness measured the following results (30 phrases × 3 trials, same machine):
+The upstream design spawns `whisper-cli` and reloads the model from disk for every utterance. smoltalk adds an in-process `whisper-rs` provider. With the default `keep_warm_for_secs = 0`, it starts audio capture, loads `base.en-q5_0` and its inference state during recording, transcribes after release, then unloads the model and state. Measured PSS on the test machine was approximately 250 MiB while loaded and 54 MiB after unloading. Positive `keep_warm_for_secs` values retain the model between recordings. With retention enabled, the bundled harness measured the following results (30 phrases × 3 trials, same machine):
 
 | | whisper-cli subprocess | warm whisper-rs |
 |---|---|---|
@@ -33,7 +33,7 @@ Other changes since the fork:
 
 - Keybind toggle and push-to-talk recording
 - Local transcription via whisper-rs (in-process and cold while idle by default); whisper.cpp CLI, OpenAI CLI, and OpenAI API providers also available
-- Memory-conscious by default: prepares the model while you speak, then releases its inference state after each recording
+- Default model lifecycle: approximately 250 MiB PSS while loaded and 54 MiB after unloading on the test machine
 - Text injection with clipboard preservation
 - Visual recording indicators and Waybar integration
 - Single TOML config
