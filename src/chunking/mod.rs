@@ -1,12 +1,12 @@
-use crate::audio::{write_samples_to_wav, FinalRecordingSnapshot, RecordingBuffer};
+use crate::audio::{FinalRecordingSnapshot, RecordingBuffer};
 use crate::bench_trace;
 use crate::config::ChunkingConfig;
 use crate::transcription::TranscriptionService;
 use crate::vad::VadSettings;
+use crate::whisper::provider::AudioFileRetention;
 use anyhow::{Context, Result};
 use std::future::Future;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -299,8 +299,6 @@ async fn transcribe_chunk(
     session_id: u64,
     chunk_index: usize,
 ) -> Result<String> {
-    let path = chunk_path(session_id, chunk_index);
-    let path_for_worker = path.clone();
     let runtime = tokio::runtime::Handle::current();
     bench_trace::event_with_extra("chunk_transcription_begin", || {
         serde_json::json!({
@@ -311,12 +309,9 @@ async fn transcribe_chunk(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            write_samples_to_wav(&path_for_worker, &samples)?;
-            runtime.block_on(transcription_service.transcribe(&path_for_worker))
-        })();
-        let _ = std::fs::remove_file(&path_for_worker);
-        result
+        runtime.block_on(
+            transcription_service.transcribe_samples(&samples, AudioFileRetention::Delete),
+        )
     })
     .await
     .context("pause chunk transcription worker panicked")?;
@@ -329,13 +324,6 @@ async fn transcribe_chunk(
         })
     });
     result
-}
-
-fn chunk_path(session_id: u64, chunk_index: usize) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "chezwizper-{}-{session_id}-chunk-{chunk_index}.wav",
-        std::process::id()
-    ))
 }
 
 async fn run_session<F, Fut>(
@@ -437,9 +425,58 @@ where
 mod tests {
     use super::*;
     use crate::audio::RecordingBuffer;
+    use crate::whisper::provider::{AudioFileRetention, TranscriptionProvider};
+    use crate::whisper::WhisperTranscriber;
+    use std::path::Path;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[derive(Debug, PartialEq)]
+    struct ObservedChunkSamples {
+        samples: Vec<f32>,
+        retention: AudioFileRetention,
+    }
+
+    type SharedObservedChunkSamples = Arc<Mutex<Option<ObservedChunkSamples>>>;
+
+    struct ChunkSampleProvider {
+        observed: SharedObservedChunkSamples,
+    }
+
+    impl TranscriptionProvider for ChunkSampleProvider {
+        fn name(&self) -> &'static str {
+            "chunk-sample-provider"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn transcribe<'a>(
+            &'a self,
+            _audio_path: &'a Path,
+            _language: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            panic!("chunk transcription must not use the path route")
+        }
+
+        fn transcribe_samples<'a>(
+            &'a self,
+            samples: &'a [f32],
+            _language: &'a str,
+            retention: AudioFileRetention,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                *self.observed.lock().unwrap() = Some(ObservedChunkSamples {
+                    samples: samples.to_vec(),
+                    retention,
+                });
+                Ok("chunk transcript".to_string())
+            })
+        }
+    }
 
     fn settings() -> PauseSegmenterSettings {
         PauseSegmenterSettings {
@@ -596,10 +633,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunk_transcription_uses_the_sample_pipeline_with_delete_retention() {
+        let observed = Arc::new(Mutex::new(None));
+        let whisper = WhisperTranscriber::from_provider(
+            Box::new(ChunkSampleProvider {
+                observed: observed.clone(),
+            }),
+            "en",
+        );
+        let service = Arc::new(TranscriptionService::new(whisper).unwrap());
+        let samples = vec![0.125, -0.25, 0.5];
+        let session_id = u64::MAX;
+        let chunk_index = usize::MAX;
+
+        let result = transcribe_chunk(service, samples.clone(), session_id, chunk_index).await;
+
+        assert_eq!(result.unwrap(), "chunk transcript");
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(ObservedChunkSamples {
+                samples,
+                retention: AudioFileRetention::Delete,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn worker_transcribes_a_pause_chunk_before_finalizing_the_tail() {
         let first = audio(&[(500, 0.0), (6_000, 0.1), (700, 0.0)]);
         let mut complete = first.clone();
         complete.extend(audio(&[(6_000, 0.1)]));
+        let mut expected_segmenter = PauseSegmenter::new(settings());
+        let first_range = expected_segmenter.ready_segments(&first).remove(0);
+        let expected_first = first[first_range].to_vec();
+        assert!(expected_segmenter.ready_segments(&complete).is_empty());
+        let tail_range = expected_segmenter
+            .finish_with_speech_end(&complete, complete.len())
+            .unwrap();
+        let expected_tail = complete[tail_range].to_vec();
         let buffer = RecordingBuffer::new(Arc::new(Mutex::new(first)));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let transcribe_calls = calls.clone();
@@ -611,7 +682,7 @@ mod tests {
             command_rx,
             Duration::from_millis(1),
             move |samples, index| {
-                transcribe_calls.lock().unwrap().push(samples.len());
+                transcribe_calls.lock().unwrap().push(samples);
                 async move {
                     Ok(match index {
                         0 => "the first segment ends here".to_string(),
@@ -641,7 +712,7 @@ mod tests {
             .expect("worker is running");
         let text = worker.await.unwrap().unwrap().expect("finished transcript");
 
-        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(*calls.lock().unwrap(), vec![expected_first, expected_tail]);
         assert_eq!(text, "the first segment ends here and continues");
     }
 
@@ -677,6 +748,29 @@ mod tests {
             .expect("worker is running");
 
         assert!(worker.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn chunk_callback_errors_fail_the_session() {
+        let samples = vec![0.1, 0.2, 0.3];
+        let mut transcripts = Vec::new();
+        let mut chunk_index = 0;
+        let mut transcribe = |_samples, _index| async {
+            Err::<String, _>(anyhow::anyhow!("injected chunk callback failure"))
+        };
+
+        let result = transcribe_ranges(
+            std::iter::once(0..samples.len()).collect(),
+            &samples,
+            &mut transcripts,
+            &mut chunk_index,
+            &mut transcribe,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(transcripts.is_empty());
+        assert_eq!(chunk_index, 0);
     }
 
     #[tokio::test]

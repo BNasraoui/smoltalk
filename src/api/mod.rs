@@ -11,8 +11,8 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tracing::{error, info};
 
@@ -36,6 +36,36 @@ pub enum AppStatus {
     Processing,
 }
 
+pub(crate) type SharedAppStatus = Arc<Mutex<AppStatus>>;
+
+pub(crate) fn lock_app_status(status: &SharedAppStatus) -> MutexGuard<'_, AppStatus> {
+    status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[allow(dead_code)] // main.rs compiles this module separately from the library crate.
+pub(crate) struct ProcessingResetGuard {
+    status: SharedAppStatus,
+}
+
+#[allow(dead_code)]
+impl ProcessingResetGuard {
+    pub(crate) fn new(status: SharedAppStatus) -> Self {
+        Self { status }
+    }
+}
+
+impl Drop for ProcessingResetGuard {
+    fn drop(&mut self) {
+        {
+            let mut status = lock_app_status(&self.status);
+            *status = AppStatus::Idle;
+        }
+        bench_trace::event("state_idle_set");
+    }
+}
+
 impl AppStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -49,7 +79,7 @@ impl AppStatus {
 #[derive(Clone)]
 pub struct AppState {
     tx: mpsc::Sender<ApiCommand>,
-    status: Arc<Mutex<AppStatus>>,
+    status: SharedAppStatus,
     waybar_config: WaybarConfig,
     transcription: Arc<TranscriptionService>,
 }
@@ -62,7 +92,7 @@ pub struct ApiServer {
 impl ApiServer {
     pub fn new(
         tx: mpsc::Sender<ApiCommand>,
-        status: Arc<Mutex<AppStatus>>,
+        status: SharedAppStatus,
         config: &Config,
         transcription: Arc<TranscriptionService>,
     ) -> Self {
@@ -114,25 +144,25 @@ async fn status() -> Json<Value> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecordingRequest {
+pub(crate) enum RecordingRequest {
     Start,
     Stop,
     Toggle,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct ReservationOutcome {
+pub(crate) struct ReservationOutcome {
     success: bool,
     message: &'static str,
     status: AppStatus,
 }
 
-async fn reserve_recording_command(
+pub(crate) async fn reserve_recording_command(
     tx: &mpsc::Sender<ApiCommand>,
-    status: &Arc<Mutex<AppStatus>>,
+    status: &SharedAppStatus,
     request: RecordingRequest,
 ) -> Result<ReservationOutcome, StatusCode> {
-    let mut current_status = status.lock().await;
+    let mut current_status = lock_app_status(status);
     let command = match (request, *current_status) {
         (RecordingRequest::Start | RecordingRequest::Toggle, AppStatus::Idle) => {
             *current_status = AppStatus::Recording;
@@ -188,7 +218,7 @@ impl RecordingRequest {
 }
 
 async fn start_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let status = *state.status.lock().await;
+    let status = *lock_app_status(&state.status);
     bench_trace::event_with_extra("api_start_received", || {
         json!({
             "status": status.as_str(),
@@ -207,7 +237,7 @@ async fn start_recording(State(state): State<AppState>) -> Result<Json<Value>, S
 }
 
 async fn stop_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let status = *state.status.lock().await;
+    let status = *lock_app_status(&state.status);
     bench_trace::event_with_extra("api_stop_received", || {
         json!({
             "status": status.as_str(),
@@ -226,7 +256,7 @@ async fn stop_recording(State(state): State<AppState>) -> Result<Json<Value>, St
 }
 
 async fn toggle_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let status = *state.status.lock().await;
+    let status = *lock_app_status(&state.status);
     bench_trace::event_with_extra("api_toggle_received", || {
         json!({
             "status": status.as_str(),
@@ -255,7 +285,7 @@ async fn recording_status(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> Json<Value> {
-    let status = *state.status.lock().await;
+    let status = *lock_app_status(&state.status);
 
     // Check if waybar style is requested
     if params.get("style") == Some(&"waybar".to_string()) {
@@ -337,6 +367,32 @@ mod tests {
         assert_eq!(response["tooltip"], config.processing_tooltip);
     }
 
+    #[test]
+    fn processing_reset_guard_restores_idle() {
+        let status: SharedAppStatus = Arc::new(std::sync::Mutex::new(AppStatus::Processing));
+
+        {
+            let _guard = ProcessingResetGuard::new(status.clone());
+        }
+
+        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
+    }
+
+    #[test]
+    fn app_status_lock_recovers_after_poisoning() {
+        let status: SharedAppStatus = Arc::new(std::sync::Mutex::new(AppStatus::Processing));
+        let panic_status = status.clone();
+
+        let _ = std::panic::catch_unwind(move || {
+            let _status = panic_status.lock().expect("status should start unpoisoned");
+            panic!("poison status mutex");
+        });
+
+        *lock_app_status(&status) = AppStatus::Idle;
+
+        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
+    }
+
     #[tokio::test]
     async fn start_from_idle_reserves_recording_and_enqueues_start() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -347,7 +403,7 @@ mod tests {
             .expect("start should enqueue");
 
         assert_eq!(outcome.status, AppStatus::Recording);
-        assert_eq!(*status.lock().await, AppStatus::Recording);
+        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StartRecording(ApiCommandSource::Start))
@@ -364,7 +420,7 @@ mod tests {
             .expect("duplicate start should be accepted");
 
         assert_eq!(outcome.status, AppStatus::Recording);
-        assert_eq!(*status.lock().await, AppStatus::Recording);
+        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -378,7 +434,7 @@ mod tests {
             .expect("start during processing should be accepted as a no-op");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*status.lock().await, AppStatus::Processing);
+        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -392,7 +448,7 @@ mod tests {
             .expect("stop should enqueue");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*status.lock().await, AppStatus::Processing);
+        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StopRecording(ApiCommandSource::Stop))
@@ -409,7 +465,7 @@ mod tests {
             .expect("stop from idle should be accepted as a no-op");
 
         assert_eq!(outcome.status, AppStatus::Idle);
-        assert_eq!(*status.lock().await, AppStatus::Idle);
+        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -423,7 +479,7 @@ mod tests {
             .expect("stop during processing should be accepted as a no-op");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*status.lock().await, AppStatus::Processing);
+        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -437,7 +493,7 @@ mod tests {
             .expect("toggle from idle should enqueue start");
 
         assert_eq!(outcome.status, AppStatus::Recording);
-        assert_eq!(*status.lock().await, AppStatus::Recording);
+        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StartRecording(ApiCommandSource::Toggle))
@@ -454,7 +510,7 @@ mod tests {
             .expect("toggle from recording should enqueue stop");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*status.lock().await, AppStatus::Processing);
+        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StopRecording(ApiCommandSource::Toggle))
@@ -472,7 +528,7 @@ mod tests {
 
         assert!(!outcome.success);
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*status.lock().await, AppStatus::Processing);
+        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -488,7 +544,7 @@ mod tests {
             .await
             .expect("stop should enqueue before start is consumed");
 
-        assert_eq!(*status.lock().await, AppStatus::Processing);
+        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StartRecording(ApiCommandSource::Start))
@@ -509,7 +565,7 @@ mod tests {
         let result = reserve_recording_command(&tx, &status, RecordingRequest::Start).await;
 
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(*status.lock().await, AppStatus::Idle);
+        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StopRecording(ApiCommandSource::Stop))
@@ -526,7 +582,7 @@ mod tests {
         let result = reserve_recording_command(&tx, &status, RecordingRequest::Stop).await;
 
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(*status.lock().await, AppStatus::Recording);
+        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
         assert_eq!(
             rx.recv().await,
             Some(ApiCommand::StartRecording(ApiCommandSource::Start))

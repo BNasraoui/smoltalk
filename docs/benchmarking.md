@@ -10,7 +10,7 @@ The daemon emits JSONL trace events when `CHEZWIZPER_BENCH_TRACE` is set:
 CHEZWIZPER_BENCH_TRACE=/tmp/events.jsonl chezwizper
 ```
 
-Every phase of the dictation path is stamped with monotonic nanosecond timings: API receive, main-loop dequeue, audio start / first sample / stop, samples taken, WAV write, transcription begin/end, provider spawn/exit, clipboard copy, injection begin/end, and idle/error transitions. When the variable is unset the sink is a no-op — zero overhead in normal use.
+Every phase of the dictation path is stamped with monotonic nanosecond timings: API receive, main-loop dequeue, audio start / first sample / stop, samples taken, transcription begin/end, provider spawn/exit, clipboard copy, injection begin/end, and idle/error transitions. `wav_write_begin` and `wav_write_done` are conditional: they appear only when a file-based provider materializes a WAV. In-memory providers such as whisper-rs do not emit synthetic WAV events. When the variable is unset the sink is a no-op — zero overhead in normal use.
 
 Experimental pause chunking also emits `chunk_transcription_begin` and `chunk_transcription_end`, including session ID, chunk index, sample count, and success.
 
@@ -53,7 +53,9 @@ Each run directory contains:
 
 ### Interpreting results
 
-- `wav_to_transcription_ms` dominates everything else in the pipeline (capture, WAV write, and clipboard are ~60 ms combined).
+- `total_stop_to_text_ms` is the provider-independent acceptance metric for comparisons between file-backed and in-memory runs.
+- `stop_to_wav_ms` is provider-specific. It is `null` for in-memory providers and measures the real WAV phase only when a provider writes one.
+- `wav_to_transcription_ms` is retained for artifact compatibility. Despite its legacy name, it is calculated from `transcription_begin` to `transcription_end` and represents the complete transcription pipeline duration, including a file provider's sample-to-WAV adapter.
 - Whisper pads every clip to a fixed 30-second encoder window, so transcription time is roughly **constant with respect to clip length** unless `audio_ctx` shrinking is enabled (`audio_ctx = "auto"` in `[whisper]`).
 - Injection timing is only measured with `--measure-injection`, which enables auto-paste in the scratch daemon — text will be typed into the focused window, so give it a sacrificial editor window.
 

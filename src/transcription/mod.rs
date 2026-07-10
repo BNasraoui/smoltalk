@@ -4,7 +4,7 @@ use tracing::{debug, info};
 
 use crate::bench_trace;
 use crate::normalizer::Normalizer;
-use crate::whisper::provider::ModelStatusSnapshot;
+use crate::whisper::provider::{AudioFileRetention, ModelStatusSnapshot};
 use crate::whisper::WhisperTranscriber;
 
 /// Service that orchestrates transcription and normalization
@@ -25,6 +25,7 @@ impl TranscriptionService {
     }
 
     /// Transcribe audio file and return normalized text
+    #[allow(dead_code)] // main.rs compiles this module separately and uses the sample route.
     pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
         info!("Starting transcription pipeline for: {:?}", audio_path);
         bench_trace::event_with_extra("transcription_begin", || {
@@ -36,6 +37,32 @@ impl TranscriptionService {
         // Step 1: Get raw transcription from whisper
         debug!("Getting raw transcription from whisper");
         let raw_transcription = self.whisper.transcribe(audio_path).await?;
+        Ok(self.normalize_transcription(raw_transcription))
+    }
+
+    /// Transcribe mono, 16 kHz, 32-bit float samples and return normalized text.
+    pub async fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        retention: AudioFileRetention,
+    ) -> Result<String> {
+        info!(
+            "Starting transcription pipeline for {} in-memory samples",
+            samples.len()
+        );
+        bench_trace::event_with_extra("transcription_begin", || {
+            serde_json::json!({
+                "input_kind": "samples",
+                "samples": samples.len(),
+            })
+        });
+
+        debug!("Getting raw transcription from whisper");
+        let raw_transcription = self.whisper.transcribe_samples(samples, retention).await?;
+        Ok(self.normalize_transcription(raw_transcription))
+    }
+
+    fn normalize_transcription(&self, raw_transcription: String) -> String {
         bench_trace::event_with_extra("transcription_raw_done", || {
             serde_json::json!({
                 "raw_chars": raw_transcription.len(),
@@ -63,7 +90,7 @@ impl TranscriptionService {
             normalized.len()
         );
 
-        Ok(normalized)
+        normalized
     }
 
     pub async fn prepare(&self) -> Result<()> {
@@ -93,11 +120,53 @@ impl TranscriptionService {
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
+    use super::*;
+    use crate::whisper::provider::{AudioFileRetention, TranscriptionProvider};
+    use std::future::Future;
+    use std::path::Path;
+    use std::pin::Pin;
+
+    struct RawSampleProvider;
+
+    impl TranscriptionProvider for RawSampleProvider {
+        fn name(&self) -> &'static str {
+            "raw-sample-provider"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn transcribe<'a>(
+            &'a self,
+            _audio_path: &'a Path,
+            _language: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            panic!("sample pipeline must not call the path route")
+        }
+
+        fn transcribe_samples<'a>(
+            &'a self,
+            _samples: &'a [f32],
+            _language: &'a str,
+            _retention: AudioFileRetention,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async {
+                Ok("[00:00:00.000 --> 00:00:01.000] hello [BLANK_AUDIO] world".to_string())
+            })
+        }
+    }
 
     #[tokio::test]
-    async fn test_transcription_service_creation() {
-        //TODO: implement this
-        // NOTE:: This would require mocking WhisperTranscriber
+    async fn sample_pipeline_normalizes_provider_output() {
+        let whisper = WhisperTranscriber::from_provider(Box::new(RawSampleProvider), "en");
+        let service = TranscriptionService::new(whisper).unwrap();
+
+        let text = service
+            .transcribe_samples(&[0.1, 0.2], AudioFileRetention::Delete)
+            .await
+            .unwrap();
+
+        assert_eq!(text, "hello world");
     }
 }

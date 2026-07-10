@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
@@ -19,6 +19,22 @@ pub enum RecordingState {
     Stopping,
 }
 
+struct RecordingStateResetGuard {
+    state: Arc<Mutex<RecordingState>>,
+}
+
+impl RecordingStateResetGuard {
+    fn new(state: Arc<Mutex<RecordingState>>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for RecordingStateResetGuard {
+    fn drop(&mut self) {
+        *self.state.lock().unwrap() = RecordingState::Idle;
+    }
+}
+
 /// Manages the lifecycle of audio streams and recordings
 pub struct AudioStreamManager {
     device: cpal::Device,
@@ -31,7 +47,7 @@ pub struct AudioStreamManager {
 }
 
 pub enum RecordedAudio {
-    Speech(PathBuf),
+    Speech(Vec<f32>),
     NoSpeech,
 }
 
@@ -176,18 +192,17 @@ impl AudioStreamManager {
         Ok(())
     }
 
-    /// Stop recording and save audio to file
-    pub async fn stop_recording(&self, output_path: PathBuf) -> Result<RecordedAudio> {
-        self.stop_recording_inner(output_path, false)
+    /// Stop recording and return the VAD-trimmed audio samples.
+    pub async fn stop_recording(&self) -> Result<RecordedAudio> {
+        self.stop_recording_inner(false)
             .await
             .map(|(audio, _)| audio)
     }
 
     pub async fn stop_recording_with_snapshot(
         &self,
-        output_path: PathBuf,
     ) -> Result<(RecordedAudio, FinalRecordingSnapshot)> {
-        let (audio, snapshot) = self.stop_recording_inner(output_path, true).await?;
+        let (audio, snapshot) = self.stop_recording_inner(true).await?;
         Ok((
             audio,
             snapshot.context("final recording snapshot was not retained")?,
@@ -196,14 +211,9 @@ impl AudioStreamManager {
 
     async fn stop_recording_inner(
         &self,
-        output_path: PathBuf,
         retain_snapshot: bool,
     ) -> Result<(RecordedAudio, Option<FinalRecordingSnapshot>)> {
-        bench_trace::event_with_extra("audio_stop_begin", || {
-            serde_json::json!({
-                "output_path": output_path.display().to_string(),
-            })
-        });
+        bench_trace::event("audio_stop_begin");
         let mut state = self.state.lock().unwrap();
 
         match *state {
@@ -218,6 +228,7 @@ impl AudioStreamManager {
 
         *state = RecordingState::Stopping;
         drop(state); // Release lock before cleanup
+        let _state_reset_guard = RecordingStateResetGuard::new(self.state.clone());
 
         // Stop and cleanup stream
         self.cleanup_stream();
@@ -232,7 +243,6 @@ impl AudioStreamManager {
         });
 
         if samples.is_empty() {
-            *self.state.lock().unwrap() = RecordingState::Idle;
             bench_trace::event_with_extra("trial_error", || {
                 serde_json::json!({
                     "phase": "samples_taken",
@@ -254,19 +264,10 @@ impl AudioStreamManager {
                 .map_or(0, |range| range.end),
         });
         if vad_output.skipped {
-            *self.state.lock().unwrap() = RecordingState::Idle;
-            info!("VAD detected no speech; skipping WAV write and transcription");
-            return Ok((RecordedAudio::NoSpeech, snapshot));
+            info!("VAD detected no speech; skipping transcription");
         }
 
-        let write_result = write_samples_to_wav(&output_path, &vad_output.samples);
-
-        *self.state.lock().unwrap() = RecordingState::Idle;
-
-        write_result?;
-
-        info!("Audio saved to: {:?}", output_path);
-        Ok((RecordedAudio::Speech(output_path), snapshot))
+        Ok((recorded_audio_from_vad(vad_output), snapshot))
     }
 
     /// Cleanup any active stream
@@ -290,6 +291,14 @@ fn trace_vad_output(output: &VadOutput) {
             "skipped": output.skipped,
         })
     });
+}
+
+fn recorded_audio_from_vad(output: VadOutput) -> RecordedAudio {
+    if output.skipped {
+        RecordedAudio::NoSpeech
+    } else {
+        RecordedAudio::Speech(output.samples)
+    }
 }
 
 fn take_samples_with_snapshot(
@@ -397,5 +406,57 @@ mod tests {
         assert_eq!(taken, vec![0.1, 0.2, 0.3]);
         assert_eq!(snapshot, Some(vec![0.1, 0.2, 0.3]));
         assert!(samples.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn vad_speech_result_owns_trimmed_samples() {
+        let trimmed = vec![0.25, -0.5, 0.75];
+        let output = VadOutput {
+            samples: trimmed.clone(),
+            speech_range: Some(4..7),
+            input_samples: 11,
+            output_samples: trimmed.len(),
+            skipped: false,
+            engine: "test",
+        };
+
+        match recorded_audio_from_vad(output) {
+            RecordedAudio::Speech(samples) => assert_eq!(samples, trimmed),
+            RecordedAudio::NoSpeech => panic!("speech samples should not be discarded"),
+        }
+    }
+
+    #[test]
+    fn skipped_vad_result_returns_no_speech_without_creating_a_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let unexpected_wav = directory.path().join("unexpected.wav");
+        let output = VadOutput {
+            samples: Vec::new(),
+            speech_range: None,
+            input_samples: 100,
+            output_samples: 0,
+            skipped: true,
+            engine: "test",
+        };
+
+        assert!(matches!(
+            recorded_audio_from_vad(output),
+            RecordedAudio::NoSpeech
+        ));
+        assert!(!unexpected_wav.exists());
+    }
+
+    #[test]
+    fn recording_state_reset_guard_restores_idle_during_unwind() {
+        let state = Arc::new(Mutex::new(RecordingState::Stopping));
+        let panic_state = state.clone();
+
+        let result = std::panic::catch_unwind(move || {
+            let _guard = RecordingStateResetGuard::new(panic_state);
+            panic!("injected stop panic");
+        });
+
+        assert!(result.is_err());
+        assert_eq!(*state.lock().unwrap(), RecordingState::Idle);
     }
 }

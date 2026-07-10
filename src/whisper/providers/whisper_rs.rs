@@ -9,7 +9,7 @@ use whisper_rs::{
 };
 
 use crate::bench_trace;
-use crate::whisper::provider::{ModelStatusSnapshot, TranscriptionProvider};
+use crate::whisper::provider::{AudioFileRetention, ModelStatusSnapshot, TranscriptionProvider};
 use crate::whisper::AudioCtxConfig;
 
 const WHISPER_SAMPLE_RATE: usize = 16_000;
@@ -267,8 +267,7 @@ impl WhisperRsProvider {
         }
     }
 
-    fn transcribe_loaded(&self, audio_path: &Path, language: &str) -> Result<String> {
-        let samples = read_wav_samples(audio_path)?;
+    fn transcribe_loaded_samples(&self, samples: &[f32], language: &str) -> Result<String> {
         let mut inner = self.inner.lock().unwrap();
         let text = {
             let params = self.full_params(language, samples.len());
@@ -278,7 +277,7 @@ impl WhisperRsProvider {
                 .context("whisper-rs state is not available")?;
 
             state
-                .full(params, &samples)
+                .full(params, samples)
                 .context("whisper-rs transcription failed")?;
 
             let mut text = String::new();
@@ -396,7 +395,20 @@ impl TranscriptionProvider for WhisperRsProvider {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
             self.ensure_loaded()?;
-            self.transcribe_loaded(audio_path, language)
+            let samples = read_wav_samples(audio_path)?;
+            self.transcribe_loaded_samples(&samples, language)
+        })
+    }
+
+    fn transcribe_samples<'a>(
+        &'a self,
+        samples: &'a [f32],
+        language: &'a str,
+        _retention: AudioFileRetention,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.ensure_loaded()?;
+            self.transcribe_loaded_samples(samples, language)
         })
     }
 }
@@ -486,7 +498,23 @@ fn trace_state_transition(status: WhisperRsModelStatus, reason: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whisper::provider::AudioFileRetention;
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    fn temporary_chezwizper_wavs() -> HashSet<PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("chezwizper-") && name.ends_with(".wav"))
+            })
+            .collect()
+    }
 
     #[test]
     fn state_machine_tracks_load_success_and_manual_unload() {
@@ -633,5 +661,113 @@ mod tests {
         .unwrap();
 
         assert!(provider.supports_chunking());
+    }
+
+    #[test]
+    fn path_input_reads_f32_wav_samples() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("float.wav");
+        let expected = vec![0.25, -0.5, 0.75];
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in &expected {
+            writer.write_sample(*sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        assert_eq!(read_wav_samples(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn path_input_reads_i16_wav_samples() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("integer.wav");
+        let encoded = [i16::MIN + 1, 0, i16::MAX];
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in encoded {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        assert_eq!(
+            read_wav_samples(&path).unwrap(),
+            encoded
+                .into_iter()
+                .map(|sample| f32::from(sample) / f32::from(i16::MAX))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_input_does_not_materialize_a_wav_when_model_load_fails() {
+        let provider = WhisperRsProvider::new(
+            "base.en".to_string(),
+            Some("/tmp/definitely-missing-chezwizper-model.bin".to_string()),
+            WhisperRsOptions::default(),
+        )
+        .unwrap();
+        let before = temporary_chezwizper_wavs();
+
+        let result = provider
+            .transcribe_samples(&[0.123_456, -0.654_321], "en", AudioFileRetention::Keep)
+            .await;
+
+        let created = temporary_chezwizper_wavs()
+            .difference(&before)
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in &created {
+            let _ = std::fs::remove_file(path);
+        }
+        assert!(result.is_err());
+        assert!(created.is_empty(), "sample input created WAVs: {created:?}");
+    }
+
+    #[tokio::test]
+    async fn model_backed_sample_input_transcribes_without_creating_a_wav() {
+        let Some(data_dir) = dirs::data_dir() else {
+            return;
+        };
+        let model_path = data_dir.join("chezwizper/whisper/models/ggml-base.en-q5_0.bin");
+        let corpus_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("bench-artifacts/corpus/wav/short_status.wav");
+        if !model_path.exists() || !corpus_path.exists() {
+            return;
+        }
+
+        let samples = read_wav_samples(&corpus_path).unwrap();
+        let provider = WhisperRsProvider::new(
+            "base.en".to_string(),
+            Some(model_path.display().to_string()),
+            WhisperRsOptions::default(),
+        )
+        .unwrap();
+        let before = temporary_chezwizper_wavs();
+
+        let text = provider
+            .transcribe_samples(&samples, "en", AudioFileRetention::Keep)
+            .await
+            .unwrap();
+
+        let created = temporary_chezwizper_wavs()
+            .difference(&before)
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in &created {
+            let _ = std::fs::remove_file(path);
+        }
+        assert!(!text.trim().is_empty());
+        assert!(created.is_empty(), "sample input created WAVs: {created:?}");
     }
 }

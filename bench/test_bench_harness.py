@@ -76,6 +76,33 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(row["total_stop_to_text_source"], "clipboard")
         self.assertEqual(row["total_stop_to_text_ms"], 900.0)
 
+    def test_successful_in_memory_trial_keeps_transcription_and_total_metrics(self):
+        events = [
+            {"event": "audio_stop_begin", "monotonic_ns": 1_000_000_000, "extra": {}},
+            {"event": "samples_taken", "monotonic_ns": 1_005_000_000, "extra": {"samples": 16_000}},
+            {"event": "transcription_begin", "monotonic_ns": 1_050_000_000, "extra": {}},
+            {"event": "transcription_end", "monotonic_ns": 1_550_000_000, "extra": {}},
+            {"event": "state_idle_set", "monotonic_ns": 1_600_000_000, "extra": {}},
+        ]
+
+        row = bench_e2e.build_trial_row(
+            run_id="run",
+            trial_id="trial",
+            phrase={"id": "phrase", "group": "short", "duration_ms": 1_000},
+            trial_events=events,
+            provider="whisper-rs",
+            model="base.en",
+            model_path="",
+            threads="",
+            resources=bench_e2e.ResourceStats(peak_rss_mb=123.0, cpu_user_ms=40.0, cpu_system_ms=5.0),
+        )
+
+        self.assertEqual(row["status"], "ok")
+        self.assertIsNone(row["stop_to_wav_ms"])
+        self.assertIsNotNone(row["wav_to_transcription_ms"])
+        self.assertIsNotNone(row["rtf"])
+        self.assertIsNotNone(row["total_stop_to_text_ms"])
+
     def test_proc_snapshot_diffs_process_tree_cpu_and_peak_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
             proc = Path(tmp)

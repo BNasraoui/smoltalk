@@ -8,7 +8,7 @@ use crate::bench_trace;
 pub mod provider;
 mod providers;
 
-use provider::{ModelStatusSnapshot, TranscriptionProvider};
+use provider::{AudioFileRetention, ModelStatusSnapshot, TranscriptionProvider};
 use providers::{
     OpenAIProvider, OpenAIWhisperCliProvider, WhisperCppOptions, WhisperCppProvider,
     WhisperRsOptions, WhisperRsProvider,
@@ -24,7 +24,7 @@ impl WhisperTranscriber {
         let language = config.language.clone().unwrap_or_else(|| "en".to_string());
         let provider = Self::auto_detect_provider(config)?;
 
-        Ok(Self { provider, language })
+        Ok(Self::from_provider(provider, language))
     }
 
     pub fn with_provider(provider_name: &str, config: ProviderConfig) -> Result<Self> {
@@ -66,7 +66,17 @@ impl WhisperTranscriber {
 
         info!("Using {} for transcription", provider.name());
 
-        Ok(Self { provider, language })
+        Ok(Self::from_provider(provider, language))
+    }
+
+    pub(crate) fn from_provider(
+        provider: Box<dyn TranscriptionProvider>,
+        language: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            language: language.into(),
+        }
     }
 
     fn auto_detect_provider(config: ProviderConfig) -> Result<Box<dyn TranscriptionProvider>> {
@@ -100,6 +110,7 @@ impl WhisperTranscriber {
         ))
     }
 
+    #[allow(dead_code)] // main.rs compiles this module separately and uses the sample route.
     pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
         info!(
             "Transcribing audio file: {:?} with {}",
@@ -118,6 +129,38 @@ impl WhisperTranscriber {
             .transcribe(audio_path.as_path(), &self.language)
             .await;
 
+        self.trace_transcription_result(&result);
+        result
+    }
+
+    pub async fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        retention: AudioFileRetention,
+    ) -> Result<String> {
+        info!(
+            "Transcribing {} in-memory samples with {}",
+            samples.len(),
+            self.provider.name()
+        );
+        bench_trace::event_with_extra("provider_transcription_begin", || {
+            serde_json::json!({
+                "provider": self.provider.name(),
+                "language": self.language.as_str(),
+                "input_kind": "samples",
+                "samples": samples.len(),
+            })
+        });
+        let result = self
+            .provider
+            .transcribe_samples(samples, &self.language, retention)
+            .await;
+
+        self.trace_transcription_result(&result);
+        result
+    }
+
+    fn trace_transcription_result(&self, result: &Result<String>) {
         match &result {
             Ok(text) => bench_trace::event_with_extra("provider_transcription_end", || {
                 serde_json::json!({
@@ -133,8 +176,6 @@ impl WhisperTranscriber {
                 })
             }),
         }
-
-        result
     }
 
     pub async fn prepare(&self) -> Result<()> {
@@ -329,7 +370,57 @@ fn combined_initial_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whisper::provider::AudioFileRetention;
     use serde::Deserialize;
+    use std::future::Future;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, PartialEq)]
+    struct ObservedSamples {
+        samples: Vec<f32>,
+        language: String,
+        retention: AudioFileRetention,
+    }
+
+    struct SampleOnlyProvider {
+        observed: Arc<Mutex<Option<ObservedSamples>>>,
+    }
+
+    impl TranscriptionProvider for SampleOnlyProvider {
+        fn name(&self) -> &'static str {
+            "sample-only"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn transcribe<'a>(
+            &'a self,
+            _audio_path: &'a Path,
+            _language: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            panic!("sample facade must not call the path transcription route")
+        }
+
+        fn transcribe_samples<'a>(
+            &'a self,
+            samples: &'a [f32],
+            language: &'a str,
+            retention: AudioFileRetention,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                *self.observed.lock().unwrap() = Some(ObservedSamples {
+                    samples: samples.to_vec(),
+                    language: language.to_string(),
+                    retention,
+                });
+                Ok("in-memory transcript".to_string())
+            })
+        }
+    }
 
     #[test]
     fn combines_initial_prompt_and_coding_vocabulary() {
@@ -401,5 +492,32 @@ mod tests {
         .unwrap();
 
         assert!(transcriber.supports_chunking());
+    }
+
+    #[tokio::test]
+    async fn sample_facade_forwards_slice_language_and_retention_to_provider_override() {
+        let observed = Arc::new(Mutex::new(None));
+        let transcriber = WhisperTranscriber {
+            provider: Box::new(SampleOnlyProvider {
+                observed: observed.clone(),
+            }),
+            language: "de".to_string(),
+        };
+        let samples = [0.25, -0.5, 0.75];
+
+        let text = transcriber
+            .transcribe_samples(&samples, AudioFileRetention::Keep)
+            .await
+            .unwrap();
+
+        assert_eq!(text, "in-memory transcript");
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(ObservedSamples {
+                samples: samples.to_vec(),
+                language: "de".to_string(),
+                retention: AudioFileRetention::Keep,
+            })
+        );
     }
 }
