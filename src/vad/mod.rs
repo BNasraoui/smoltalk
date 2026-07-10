@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -48,6 +49,7 @@ impl Default for VadSettings {
 #[derive(Debug)]
 pub struct VadOutput {
     pub samples: Vec<f32>,
+    pub speech_range: Option<Range<usize>>,
     pub input_samples: usize,
     pub output_samples: usize,
     pub skipped: bool,
@@ -84,20 +86,38 @@ impl VadProcessor {
 
     pub fn process(&self, samples: Vec<f32>) -> VadOutput {
         let input_samples = samples.len();
-        let (samples, skipped, engine) = match &self.engine {
-            ActiveVadEngine::Disabled => (samples, false, "disabled"),
+        let (samples, speech_range, skipped, engine) = match &self.engine {
+            ActiveVadEngine::Disabled => {
+                let speech_range = (!samples.is_empty()).then_some(0..samples.len());
+                (samples, speech_range, false, "disabled")
+            }
             ActiveVadEngine::Amplitude => {
                 let result = trim_with_amplitude(&samples, &self.settings, self.sample_rate);
-                (result.samples, result.skipped, "amplitude")
+                (
+                    result.samples,
+                    result.speech_range,
+                    result.skipped,
+                    "amplitude",
+                )
             }
             ActiveVadEngine::Silero(context) => {
                 match trim_with_silero(&samples, &self.settings, self.sample_rate, context) {
-                    Ok(result) => (result.samples, result.skipped, "silero"),
+                    Ok(result) => (
+                        result.samples,
+                        result.speech_range,
+                        result.skipped,
+                        "silero",
+                    ),
                     Err(error) => {
                         warn!("Silero VAD failed, falling back to amplitude VAD: {error}");
                         let result =
                             trim_with_amplitude(&samples, &self.settings, self.sample_rate);
-                        (result.samples, result.skipped, "amplitude")
+                        (
+                            result.samples,
+                            result.speech_range,
+                            result.skipped,
+                            "amplitude",
+                        )
                     }
                 }
             }
@@ -106,6 +126,7 @@ impl VadProcessor {
         let output_samples = samples.len();
         VadOutput {
             samples,
+            speech_range,
             input_samples,
             output_samples,
             skipped,
@@ -164,6 +185,7 @@ fn resolve_silero_model_path(settings: &VadSettings) -> Option<PathBuf> {
 
 struct TrimResult {
     samples: Vec<f32>,
+    speech_range: Option<Range<usize>>,
     skipped: bool,
 }
 
@@ -239,11 +261,13 @@ fn trim_with_amplitude(samples: &[f32], settings: &VadSettings, sample_rate: u32
         );
         TrimResult {
             samples: samples[padded_start..padded_end].to_vec(),
+            speech_range: Some(padded_start..padded_end),
             skipped: false,
         }
     } else {
         TrimResult {
             samples: Vec::new(),
+            speech_range: None,
             skipped: true,
         }
     }
@@ -253,6 +277,7 @@ fn trim_range(samples: &[f32], start: usize, end: usize) -> TrimResult {
     if start >= end || start >= samples.len() {
         return TrimResult {
             samples: Vec::new(),
+            speech_range: None,
             skipped: true,
         };
     }
@@ -260,6 +285,7 @@ fn trim_range(samples: &[f32], start: usize, end: usize) -> TrimResult {
     let end = end.min(samples.len());
     TrimResult {
         samples: samples[start..end].to_vec(),
+        speech_range: Some(start..end),
         skipped: false,
     }
 }
@@ -325,6 +351,23 @@ mod tests {
         assert!(!result.skipped);
         assert!(result.samples.len() >= 14_400);
         assert!(result.samples.len() <= 15_360);
+        let range = result.speech_range.expect("speech range");
+        assert_eq!(range.len(), result.samples.len());
+        assert!(range.start < 16_000);
+        assert!(range.end > 24_000);
+    }
+
+    #[test]
+    fn disabled_vad_reports_the_full_audio_range() {
+        let settings = VadSettings {
+            enabled: false,
+            ..cfg()
+        };
+        let samples = vec![0.0; 1_600];
+
+        let result = VadProcessor::new(settings, 16_000).process(samples);
+
+        assert_eq!(result.speech_range, Some(0..1_600));
     }
 
     #[test]

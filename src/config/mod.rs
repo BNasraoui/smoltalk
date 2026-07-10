@@ -12,6 +12,7 @@ pub struct Config {
     pub audio: AudioConfig,
     pub whisper: WhisperConfig,
     pub vad: VadSettings,
+    pub chunking: ChunkingConfig,
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
@@ -46,6 +47,26 @@ pub struct WhisperConfig {
     pub initial_prompt: Option<String>,
     pub coding_vocabulary: Option<String>,
     pub audio_ctx: AudioCtxConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChunkingConfig {
+    pub enabled: bool,
+    pub pause_ms: u32,
+    pub min_chunk_ms: u32,
+    pub overlap_ms: u32,
+}
+
+impl Default for ChunkingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pause_ms: 600,
+            min_chunk_ms: 5_000,
+            overlap_ms: 300,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -326,5 +347,30 @@ mod tests {
         assert_eq!(config.vad.min_speech_ms, 250);
         assert_eq!(config.vad.pad_ms, 150);
         assert_eq!(config.vad.model_path, Some(PathBuf::from("/tmp/vad.bin")));
+    }
+
+    #[test]
+    fn chunking_defaults_are_serialized_when_section_is_missing() {
+        let config: Config = toml::from_str("[audio]\ndevice = \"default\"\n").unwrap();
+        let value = toml::Value::try_from(config).unwrap();
+
+        assert_eq!(value["chunking"]["enabled"].as_bool(), Some(false));
+        assert_eq!(value["chunking"]["pause_ms"].as_integer(), Some(600));
+        assert_eq!(value["chunking"]["min_chunk_ms"].as_integer(), Some(5_000));
+        assert_eq!(value["chunking"]["overlap_ms"].as_integer(), Some(300));
+    }
+
+    #[test]
+    fn chunking_honors_explicit_values() {
+        let config: Config = toml::from_str(
+            "[chunking]\nenabled = true\npause_ms = 800\nmin_chunk_ms = 7000\noverlap_ms = 250\n",
+        )
+        .unwrap();
+        let value = toml::Value::try_from(config).unwrap();
+
+        assert_eq!(value["chunking"]["enabled"].as_bool(), Some(true));
+        assert_eq!(value["chunking"]["pause_ms"].as_integer(), Some(800));
+        assert_eq!(value["chunking"]["min_chunk_ms"].as_integer(), Some(7_000));
+        assert_eq!(value["chunking"]["overlap_ms"].as_integer(), Some(250));
     }
 }

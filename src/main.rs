@@ -3,6 +3,7 @@
 mod api;
 mod audio;
 mod bench_trace;
+mod chunking;
 mod config;
 mod normalizer;
 mod text_injection;
@@ -21,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::api::{ApiCommand, ApiCommandSource, ApiServer, AppStatus};
 use crate::audio::{AudioStreamManager, RecordedAudio};
+use crate::chunking::PauseChunkingSession;
 use crate::config::Config;
 use crate::text_injection::TextInjector;
 use crate::transcription::TranscriptionService;
@@ -151,6 +153,8 @@ async fn main() -> Result<()> {
     info!("bindd = SUPER, R, ChezWizper, exec, curl -X POST http://127.0.0.1:3737/toggle");
     info!("Or test manually: curl -X POST http://127.0.0.1:3737/toggle");
 
+    let mut chunking_session: Option<PauseChunkingSession> = None;
+
     // Main event loop
     while let Some(command) = rx.recv().await {
         match command {
@@ -176,6 +180,16 @@ async fn main() -> Result<()> {
                     let _ = indicator
                         .show_error(&format!("Recording failed: {e}"))
                         .await;
+                } else if config.chunking.enabled && transcription_service.supports_chunking() {
+                    chunking_session = Some(PauseChunkingSession::start(
+                        &config.chunking,
+                        &config.vad,
+                        audio_recorder.sample_rate(),
+                        audio_recorder.recording_buffer(),
+                        transcription_service.clone(),
+                    ));
+                } else if config.chunking.enabled {
+                    tracing::warn!("Pause chunking is only supported by the whisper-rs provider");
                 }
             }
             ApiCommand::StopRecording(source) => {
@@ -190,10 +204,24 @@ async fn main() -> Result<()> {
                         .as_secs()
                 ));
 
-                let stop_result = {
+                let active_chunking_session = chunking_session.take();
+                let (stop_result, final_samples) = {
                     let audio_recorder = state.audio_recorder.lock().await;
-                    audio_recorder.stop_recording(temp_path.clone()).await
+                    if active_chunking_session.is_some() {
+                        match audio_recorder
+                            .stop_recording_with_snapshot(temp_path.clone())
+                            .await
+                        {
+                            Ok((audio, samples)) => (Ok(audio), Some(samples)),
+                            Err(error) => (Err(error), None),
+                        }
+                    } else {
+                        (audio_recorder.stop_recording(temp_path.clone()).await, None)
+                    }
                 };
+
+                let mut active_chunking_session = active_chunking_session;
+                let mut final_samples = final_samples;
 
                 match stop_result {
                     Ok(RecordedAudio::Speech(audio_path)) => {
@@ -202,8 +230,24 @@ async fn main() -> Result<()> {
                             error!("Failed to show processing indicator: {}", e);
                         }
 
+                        let transcription_result = match (
+                            active_chunking_session.take(),
+                            final_samples.take(),
+                        ) {
+                            (Some(session), Some(samples)) => match session.finish(samples).await {
+                                Ok(text) => Ok(text),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "Pause chunking failed; falling back to full transcription: {error}"
+                                    );
+                                    transcription_service.transcribe(&audio_path).await
+                                }
+                            },
+                            _ => transcription_service.transcribe(&audio_path).await,
+                        };
+
                         // Transcribe audio
-                        match transcription_service.transcribe(&audio_path).await {
+                        match transcription_result {
                             Ok(text) => {
                                 if !text.is_empty() {
                                     info!("Transcription successful: {} chars", text.len());
@@ -247,6 +291,9 @@ async fn main() -> Result<()> {
                         }
                     }
                     Ok(RecordedAudio::NoSpeech) => {
+                        if let Some(session) = active_chunking_session.take() {
+                            session.cancel().await;
+                        }
                         bench_trace::event_with_extra("transcription_skipped", || {
                             serde_json::json!({
                                 "reason": "no_speech",
@@ -255,6 +302,9 @@ async fn main() -> Result<()> {
                         let _ = indicator.show_error("No speech detected").await;
                     }
                     Err(e) => {
+                        if let Some(session) = active_chunking_session.take() {
+                            session.cancel().await;
+                        }
                         error!("Failed to stop recording: {}", e);
                         bench_trace::event_with_extra("trial_error", || {
                             serde_json::json!({

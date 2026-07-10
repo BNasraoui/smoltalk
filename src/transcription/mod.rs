@@ -70,6 +70,10 @@ impl TranscriptionService {
         self.whisper.prepare().await
     }
 
+    pub fn supports_chunking(&self) -> bool {
+        self.whisper.supports_chunking()
+    }
+
     pub fn model_status(&self) -> Option<ModelStatusSnapshot> {
         self.whisper.model_status()
     }

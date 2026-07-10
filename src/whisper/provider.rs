@@ -17,6 +17,10 @@ pub trait TranscriptionProvider: Send + Sync {
 
     fn is_available(&self) -> bool;
 
+    fn supports_chunking(&self) -> bool {
+        false
+    }
+
     fn prepare<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }

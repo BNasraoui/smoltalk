@@ -12,6 +12,8 @@ CHEZWIZPER_BENCH_TRACE=/tmp/events.jsonl chezwizper
 
 Every phase of the dictation path is stamped with monotonic nanosecond timings: API receive, main-loop dequeue, audio start / first sample / stop, samples taken, WAV write, transcription begin/end, provider spawn/exit, clipboard copy, injection begin/end, and idle/error transitions. When the variable is unset the sink is a no-op — zero overhead in normal use.
 
+Experimental pause chunking also emits `chunk_transcription_begin` and `chunk_transcription_end`, including session ID, chunk index, sample count, and success.
+
 Optional metadata env vars: `CHEZWIZPER_BENCH_RUN_ID`, `CHEZWIZPER_BENCH_TRIAL_ID`, `CHEZWIZPER_BENCH_PHRASE_ID`.
 
 ## Harness

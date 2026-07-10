@@ -335,6 +335,10 @@ impl TranscriptionProvider for WhisperRsProvider {
         self.model_path.exists()
     }
 
+    fn supports_chunking(&self) -> bool {
+        true
+    }
+
     fn prepare<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move { self.ensure_loaded() })
     }
@@ -543,5 +547,17 @@ mod tests {
     fn audio_ctx_applies_safety_margin_above_raw_frame_count() {
         // 15s -> 750 raw frames + 128 margin, above the 640 floor
         assert_eq!(audio_ctx_for_sample_count(WHISPER_SAMPLE_RATE * 15), 878);
+    }
+
+    #[test]
+    fn provider_supports_pause_chunking() {
+        let provider = WhisperRsProvider::new(
+            "base.en".to_string(),
+            Some("/tmp/missing-whisper-model.bin".to_string()),
+            WhisperRsOptions::default(),
+        )
+        .unwrap();
+
+        assert!(provider.supports_chunking());
     }
 }

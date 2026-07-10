@@ -16,6 +16,7 @@ Welcome to the smoltalk documentation. smoltalk is a lean, latency-first voice d
 ### Performance
 
 - [Benchmarking](./benchmarking.md) — the trace sink, the benchmark harness, and how to measure changes before shipping them
+- [Pause-Triggered Chunking Experiment](./chunking-experiment.md) — design, initial latency results, thermal tradeoffs, and adoption gate
 
 ### Development
 

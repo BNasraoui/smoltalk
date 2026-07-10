@@ -52,6 +52,12 @@ paste_threshold_chars = 120     # Short single-line text below this is typed dir
 restore_clipboard = true        # Restore previous clipboard after a paste injection
 # force_method = "type"         # Optional: always "type" or always "paste"
 
+[chunking]
+enabled = false                 # Experimental whisper-rs pause-triggered pre-decoding
+pause_ms = 600                  # Silence required before a chunk is ready
+min_chunk_ms = 5000             # Do not decode very short chunks
+overlap_ms = 300                # Audio context retained across boundaries
+
 [ui]
 indicator_position = "top-right"  # Visual indicator position
 indicator_size = 20             # Indicator size in pixels
@@ -223,6 +229,19 @@ Controls how transcribed text lands in the focused application. Short single-lin
 | `paste_threshold_chars` | number | `120` | Single-line text at or below this length is typed directly; anything longer (or containing a newline) is pasted |
 | `force_method` | string | none | Force `"type"` or `"paste"` for all text, bypassing the hybrid decision |
 | `restore_clipboard` | bool | `true` | Restore the previous clipboard contents after a paste injection. Best-effort for plain text; rich/image/clipboard-manager state cannot be perfectly preserved by wl-clipboard/X11 tools |
+
+### [chunking] - Pause-Triggered Pre-Decoding
+
+Experimental `whisper-rs` mode for long dictation turns. Completed speech segments are transcribed in the background after natural pauses. Results remain internal and are stitched before the existing single injection on release. If chunking fails, smoltalk falls back to full-turn transcription.
+
+Chunking adds sustained CPU load while recording. Benchmark the `[whisper] threads` value on your hardware; two threads outperformed four for chunked long turns on the project's two-core test laptop. See the [chunking experiment](./chunking-experiment.md).
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable pause-triggered chunking. Currently supported only by `whisper-rs` |
+| `pause_ms` | number | `600` | Consecutive silence required before an eligible segment is decoded |
+| `min_chunk_ms` | number | `5000` | Minimum speech span before decoding, avoiding repeated work on tiny chunks |
+| `overlap_ms` | number | `300` | Audio retained across boundaries for context; clamped to `pause_ms` |
 
 ### [api] - HTTP API
 

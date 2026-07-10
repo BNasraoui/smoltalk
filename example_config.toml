@@ -61,6 +61,17 @@ pad_ms = 200
 # but normal auto-detection expects ggml-silero-v5.1.2.bin (from download-vad-model.sh).
 # model_path = "/home/you/.local/share/chezwizper/whisper/models/ggml-silero-v5.1.2.bin"
 
+[chunking]
+# Experimental whisper-rs mode: transcribe completed speech segments during
+# natural pauses, then stitch and inject once when recording stops.
+enabled = false
+# A pause this long makes an eligible segment ready for background transcription.
+pause_ms = 600
+# Avoid repeatedly paying Whisper's minimum encoder context for tiny chunks.
+min_chunk_ms = 5000
+# Audio retained across segment boundaries; clamped to pause_ms.
+overlap_ms = 300
+
 [ui]
 indicator_position = "top-right"
 indicator_size = 20

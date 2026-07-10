@@ -35,6 +35,28 @@ pub enum RecordedAudio {
     NoSpeech,
 }
 
+#[derive(Debug)]
+pub struct FinalRecordingSnapshot {
+    pub samples: Vec<f32>,
+    pub speech_end: usize,
+}
+
+#[derive(Clone)]
+pub struct RecordingBuffer {
+    samples: Arc<Mutex<Vec<f32>>>,
+}
+
+impl RecordingBuffer {
+    pub(crate) fn new(samples: Arc<Mutex<Vec<f32>>>) -> Self {
+        Self { samples }
+    }
+
+    pub fn read_from(&self, offset: usize) -> Vec<f32> {
+        let samples = self.samples.lock().unwrap();
+        samples.get(offset..).unwrap_or_default().to_vec()
+    }
+}
+
 /// Resolve the configured `[audio] device` name to a cpal input device.
 /// An unknown name warns and falls back to the system default rather than
 /// failing: dictation must keep working after a device disappears.
@@ -83,6 +105,14 @@ impl AudioStreamManager {
             first_sample_seen: Arc::new(AtomicBool::new(false)),
             vad: VadProcessor::new(vad_settings, sample_rate),
         })
+    }
+
+    pub fn recording_buffer(&self) -> RecordingBuffer {
+        RecordingBuffer::new(self.samples.clone())
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate.0
     }
 
     /// Start recording audio, properly managing stream lifecycle
@@ -148,6 +178,27 @@ impl AudioStreamManager {
 
     /// Stop recording and save audio to file
     pub async fn stop_recording(&self, output_path: PathBuf) -> Result<RecordedAudio> {
+        self.stop_recording_inner(output_path, false)
+            .await
+            .map(|(audio, _)| audio)
+    }
+
+    pub async fn stop_recording_with_snapshot(
+        &self,
+        output_path: PathBuf,
+    ) -> Result<(RecordedAudio, FinalRecordingSnapshot)> {
+        let (audio, snapshot) = self.stop_recording_inner(output_path, true).await?;
+        Ok((
+            audio,
+            snapshot.context("final recording snapshot was not retained")?,
+        ))
+    }
+
+    async fn stop_recording_inner(
+        &self,
+        output_path: PathBuf,
+        retain_snapshot: bool,
+    ) -> Result<(RecordedAudio, Option<FinalRecordingSnapshot>)> {
         bench_trace::event_with_extra("audio_stop_begin", || {
             serde_json::json!({
                 "output_path": output_path.display().to_string(),
@@ -172,7 +223,7 @@ impl AudioStreamManager {
         self.cleanup_stream();
 
         // Move samples out without copying the full recording buffer.
-        let samples = take_samples(&self.samples);
+        let (samples, raw_snapshot) = take_samples_with_snapshot(&self.samples, retain_snapshot);
         bench_trace::event_with_extra("samples_taken", || {
             serde_json::json!({
                 "samples": samples.len(),
@@ -195,10 +246,17 @@ impl AudioStreamManager {
 
         let vad_output = self.vad.process(samples);
         trace_vad_output(&vad_output);
+        let snapshot = raw_snapshot.map(|samples| FinalRecordingSnapshot {
+            samples,
+            speech_end: vad_output
+                .speech_range
+                .as_ref()
+                .map_or(0, |range| range.end),
+        });
         if vad_output.skipped {
             *self.state.lock().unwrap() = RecordingState::Idle;
             info!("VAD detected no speech; skipping WAV write and transcription");
-            return Ok(RecordedAudio::NoSpeech);
+            return Ok((RecordedAudio::NoSpeech, snapshot));
         }
 
         let write_result = write_samples_to_wav(&output_path, &vad_output.samples);
@@ -208,7 +266,7 @@ impl AudioStreamManager {
         write_result?;
 
         info!("Audio saved to: {:?}", output_path);
-        Ok(RecordedAudio::Speech(output_path))
+        Ok((RecordedAudio::Speech(output_path), snapshot))
     }
 
     /// Cleanup any active stream
@@ -234,12 +292,17 @@ fn trace_vad_output(output: &VadOutput) {
     });
 }
 
-fn take_samples(samples: &Arc<Mutex<Vec<f32>>>) -> Vec<f32> {
+fn take_samples_with_snapshot(
+    samples: &Arc<Mutex<Vec<f32>>>,
+    retain_snapshot: bool,
+) -> (Vec<f32>, Option<Vec<f32>>) {
     let mut samples = samples.lock().unwrap();
-    std::mem::take(&mut *samples)
+    let samples = std::mem::take(&mut *samples);
+    let snapshot = retain_snapshot.then(|| samples.clone());
+    (samples, snapshot)
 }
 
-fn write_samples_to_wav(output_path: &Path, samples: &[f32]) -> Result<()> {
+pub(crate) fn write_samples_to_wav(output_path: &Path, samples: &[f32]) -> Result<()> {
     bench_trace::event_with_extra("wav_write_begin", || {
         serde_json::json!({
             "output_path": output_path.display().to_string(),
@@ -307,9 +370,32 @@ mod tests {
     fn take_samples_moves_recorded_samples_out_of_shared_buffer() {
         let samples = Arc::new(Mutex::new(vec![0.1, 0.2, 0.3]));
 
-        let taken = take_samples(&samples);
+        let (taken, snapshot) = take_samples_with_snapshot(&samples, false);
 
         assert_eq!(taken, vec![0.1, 0.2, 0.3]);
+        assert_eq!(snapshot, None);
+        assert!(samples.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_buffer_reads_new_samples_without_consuming_them() {
+        let samples = Arc::new(Mutex::new(vec![0.1, 0.2, 0.3, 0.4]));
+        let buffer = RecordingBuffer {
+            samples: samples.clone(),
+        };
+
+        assert_eq!(buffer.read_from(2), vec![0.3, 0.4]);
+        assert_eq!(*samples.lock().unwrap(), vec![0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn taking_samples_can_retain_a_final_chunking_snapshot() {
+        let samples = Arc::new(Mutex::new(vec![0.1, 0.2, 0.3]));
+
+        let (taken, snapshot) = take_samples_with_snapshot(&samples, true);
+
+        assert_eq!(taken, vec![0.1, 0.2, 0.3]);
+        assert_eq!(snapshot, Some(vec![0.1, 0.2, 0.3]));
         assert!(samples.lock().unwrap().is_empty());
     }
 }

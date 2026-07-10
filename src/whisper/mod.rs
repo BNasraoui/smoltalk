@@ -141,6 +141,10 @@ impl WhisperTranscriber {
         self.provider.prepare().await
     }
 
+    pub fn supports_chunking(&self) -> bool {
+        self.provider.supports_chunking()
+    }
+
     pub fn model_status(&self) -> Option<ModelStatusSnapshot> {
         self.provider.model_status()
     }
@@ -364,5 +368,19 @@ mod tests {
         let fixture: AudioCtxFixture = toml::from_str("audio_ctx = \"off\"").unwrap();
 
         assert_eq!(fixture.audio_ctx, AudioCtxConfig::Full);
+    }
+
+    #[test]
+    fn transcriber_reports_pause_chunking_capability() {
+        let transcriber = WhisperTranscriber::with_provider(
+            "whisper-rs",
+            ProviderConfig {
+                model_path: Some("/tmp/missing-whisper-model.bin".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(transcriber.supports_chunking());
     }
 }
