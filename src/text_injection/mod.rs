@@ -10,7 +10,7 @@ use crate::config::{InjectionConfig, InjectionForceMethod};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CLIPBOARD_SETTLE_DELAY: Duration = Duration::from_millis(150);
+const CLIPBOARD_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 pub struct TextInjector {
     type_method: Option<TypeMethod>,
@@ -691,6 +691,40 @@ mod tests {
             fs::read_to_string(log).unwrap(),
             "copy:this is too long\npaste:wtype\ncopy:original\n"
         );
+    }
+
+    #[tokio::test]
+    async fn long_paste_remains_available_to_a_delayed_clipboard_consumer() {
+        let _guard = test_env_lock().await;
+        let dir = unique_test_dir("delayed-paste-consumer");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        let clipboard = dir.join("clipboard");
+        let pasted = dir.join("pasted");
+        fs::write(&clipboard, "original").unwrap();
+
+        install_clipboard_stubs(&dir, &log, &clipboard);
+        write_executable_script(
+            &dir.join("wtype"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-M\" ]; then (sleep 0.25; cat '{}' > '{}') >/dev/null 2>&1 & exit 0; fi\nexit 1\n",
+                clipboard.display(),
+                pasted.display()
+            ),
+        );
+
+        let old_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", prepend_path(&dir));
+
+        let injector = TextInjector::new(Some("wtype"), settings()).unwrap();
+        injector.inject_text("this is too long").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        }
+
+        assert_eq!(fs::read_to_string(pasted).unwrap(), "this is too long");
     }
 
     #[tokio::test]
