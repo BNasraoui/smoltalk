@@ -10,6 +10,8 @@ use crate::config::{InjectionConfig, InjectionForceMethod};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const TYPE_TIMEOUT_PER_CHAR_MS: u64 = 10;
+const MAX_TYPE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIPBOARD_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 pub struct TextInjector {
@@ -187,11 +189,15 @@ impl TextInjector {
     }
 
     fn inject_with_type_method(&self, method: TypeMethod, text: &str) -> Result<()> {
+        let timeout = type_command_timeout(text);
         match method {
-            TypeMethod::Wtype => run_checked(Command::new("wtype").arg(text), "wtype"),
-            TypeMethod::Ydotool => run_checked(
+            TypeMethod::Wtype => {
+                run_checked_with_timeout(Command::new("wtype").arg(text), "wtype", timeout)
+            }
+            TypeMethod::Ydotool => run_checked_with_timeout(
                 Command::new("ydotool").arg("type").arg(text),
                 "ydotool type",
+                timeout,
             ),
         }
     }
@@ -475,8 +481,21 @@ fn force_method_name(method: InjectionForceMethod) -> &'static str {
     }
 }
 
+fn type_command_timeout(text: &str) -> Duration {
+    let text_ms = u64::try_from(text.chars().count())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(TYPE_TIMEOUT_PER_CHAR_MS);
+    COMMAND_TIMEOUT
+        .saturating_add(Duration::from_millis(text_ms))
+        .min(MAX_TYPE_COMMAND_TIMEOUT)
+}
+
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {
-    let output = command_output_with_timeout(command, COMMAND_TIMEOUT)
+    run_checked_with_timeout(command, label, COMMAND_TIMEOUT)
+}
+
+fn run_checked_with_timeout(command: &mut Command, label: &str, timeout: Duration) -> Result<()> {
+    let output = command_output_with_timeout(command, timeout)
         .with_context(|| format!("Failed to execute {label}"))?;
 
     if !output.status.success() {
@@ -656,6 +675,38 @@ mod tests {
             fs::read_to_string(log).unwrap(),
             "type:hello\ntype:this is too long\ntype:again\n"
         );
+    }
+
+    #[tokio::test]
+    async fn long_type_path_allows_wtype_more_than_two_seconds() {
+        let _guard = test_env_lock().await;
+        let dir = unique_test_dir("slow-long-type");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+
+        write_executable_script(
+            &dir.join("wtype"),
+            &format!(
+                "#!/bin/sh\nsleep 2.1\nprintf 'type:%s\n' \"$*\" >> '{}'\n",
+                log.display()
+            ),
+        );
+        write_executable_script(&dir.join("wl-copy"), "#!/bin/sh\nexit 9\n");
+        write_executable_script(&dir.join("wl-paste"), "#!/bin/sh\nexit 9\n");
+
+        let old_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", prepend_path(&dir));
+
+        let text = "a".repeat(300);
+        let injector = TextInjector::new(Some("wtype"), settings()).unwrap();
+        let result = injector.inject_text(&text).await;
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        }
+
+        result.unwrap();
+        assert_eq!(fs::read_to_string(log).unwrap(), format!("type:{text}\n"));
     }
 
     #[tokio::test]
