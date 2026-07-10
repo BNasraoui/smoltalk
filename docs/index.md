@@ -20,6 +20,7 @@ Welcome to the smoltalk documentation. smoltalk is a lean, latency-first voice d
 
 ### Development
 
+- [Architecture](./architecture.md) — module map, data flow from keypress to injected text, and the design behind the latency-sensitive paths
 - [Adding Providers](./adding-providers.md) — guide for adding new transcription providers
 
 smoltalk uses a Makefile for common development tasks:
