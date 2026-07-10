@@ -8,7 +8,7 @@ The minimal configuration to get started:
 
 ```toml
 [whisper]
-# Recommended: the warm in-process provider (fastest by a wide margin)
+# Recommended: the in-process provider
 provider = "whisper-rs"
 model = "base.en"
 language = "en"
@@ -30,7 +30,7 @@ channels = 1                    # Number of audio channels (1 = mono, 2 = stereo
 provider = "whisper-rs"         # Transcription provider (see Providers section)
 model = "base.en"               # Model name (provider-specific)
 language = "en"                 # Language code (ISO 639-1)
-keep_warm_for_secs = 300        # whisper-rs: unload the model after this much idle time
+keep_warm_for_secs = 0          # whisper-rs: release model/state after each recording
 audio_ctx = "auto"              # whisper-rs: shrink encoder context to clip length (big speedup for short clips)
 # initial_prompt = "Transcribe concise technical dictation."   # whisper-rs: bias decoding
 # coding_vocabulary = "Rust, Axum, Tokio"                      # whisper-rs: appended to the prompt
@@ -109,7 +109,7 @@ Configures speech-to-text transcription providers and models.
 | `provider` | string | auto-detect | Transcription provider: `"whisper-rs"`, `"whisper-cpp"`, `"openai-cli"`, `"openai-api"`, or omit for auto-detection |
 | `model` | string | `"base"` | Model name (provider-specific, see Providers section) |
 | `language` | string | `"en"` | Language code (ISO 639-1 format) |
-| `keep_warm_for_secs` | number | none | whisper-rs: unload the model after this much idle time (stays warm forever if unset) |
+| `keep_warm_for_secs` | number | `0` | whisper-rs: `0` releases model/state when a recording finishes; a positive value retains them between recordings and unloads after that much idle time |
 | `audio_ctx` | string/number | `"auto"` | whisper-rs: `"auto"` shrinks the encoder context to the clip length; `0`/`"off"` uses the full 30s window; an integer sets it explicitly |
 | `initial_prompt` | string | none | whisper-rs: prompt to bias decoding (casing, punctuation, domain terms) |
 | `coding_vocabulary` | string | none | whisper-rs: comma-separated terms appended to the prompt |
@@ -129,10 +129,11 @@ smoltalk supports multiple transcription providers:
 
 **whisper-rs** (`provider = "whisper-rs"`) — **recommended**
 - **Best for:** Lowest latency — this is smoltalk's reason to exist
-- **How it works:** Loads the model in-process once and keeps it warm; no subprocess spawn or model reload per utterance (measured stop-to-text p50 ~1.1s vs ~3.2s for the CLI path)
+- **How it works:** Starts audio capture before preparing the model and reusable inference state in-process while you speak; no subprocess is spawned
 - **Requirements:** A ggml model file (the installer's models work; prefers quantized variants like `ggml-base.en-q5_0.bin` when present)
 - **Models:** `"tiny.en"`, `"base.en"`, `"small.en"`, and multilingual equivalents
-- **Memory:** Model stays resident (~150 MB for base.en); use `keep_warm_for_secs` to unload when idle
+- **Memory:** The default `keep_warm_for_secs = 0` releases roughly 166 MiB of incremental model/state memory when each recording reaches a terminal outcome. Set a positive value to retain it between recordings.
+- **Warm benchmark history:** With retention enabled, measured stop-to-text p50 was ~1.1s versus ~3.2s for the CLI path
 - **Note:** Not yet part of auto-detection — set it explicitly
 
 **OpenAI API** (`provider = "openai-api"`)
@@ -290,9 +291,12 @@ language = "en"  # or "auto" for automatic detection
 ```toml
 [whisper]
 provider = "whisper-rs"
-model = "base.en"    # Loads once, stays warm; ~1.1s stop-to-text
+model = "base.en"    # Prepares while recording, then releases when finished
 language = "en"
 audio_ctx = "auto"   # Shrink encoder work for short clips
+
+# Optional: retain the model between recordings (warm benchmark p50 ~1.1s)
+# keep_warm_for_secs = 300
 
 # No API key needed - everything runs locally
 ```

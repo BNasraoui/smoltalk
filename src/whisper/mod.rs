@@ -153,6 +153,10 @@ impl WhisperTranscriber {
         self.provider.unload_model()
     }
 
+    pub fn recording_complete(&self) -> Result<()> {
+        self.provider.recording_complete()
+    }
+
     pub async fn reload_model(&self) -> Result<()> {
         self.provider.reload_model().await
     }
@@ -195,7 +199,7 @@ impl Default for ProviderConfig {
             best_of: None,
             no_fallback: None,
             timeout_secs: None,
-            keep_warm_for_secs: Some(300),
+            keep_warm_for_secs: Some(0),
             initial_prompt: None,
             coding_vocabulary: None,
             audio_ctx: AudioCtxConfig::Auto,
@@ -335,6 +339,21 @@ mod tests {
             prompt,
             Some("Prefer concise text.\nRust, Tokio".to_string())
         );
+    }
+
+    #[test]
+    fn provider_config_defaults_to_releasing_the_model_between_recordings() {
+        assert_eq!(ProviderConfig::default().keep_warm_for_secs, Some(0));
+    }
+
+    #[test]
+    fn provider_config_preserves_explicit_positive_keep_warm_duration() {
+        let config = ProviderConfig {
+            keep_warm_for_secs: Some(300),
+            ..Default::default()
+        };
+
+        assert_eq!(config.whisper_rs_options().keep_warm_for_secs, Some(300));
     }
 
     #[derive(Deserialize)]

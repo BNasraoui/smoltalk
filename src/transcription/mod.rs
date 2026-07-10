@@ -82,6 +82,10 @@ impl TranscriptionService {
         self.whisper.unload_model()
     }
 
+    pub fn recording_complete(&self) -> Result<()> {
+        self.whisper.recording_complete()
+    }
+
     pub async fn reload_model(&self) -> Result<()> {
         self.whisper.reload_model().await
     }

@@ -7,7 +7,7 @@ channels = 1
 # Provider selection (defaults to auto-detection if not specified)
 # Uncomment and set provider to explicitly choose:
 # provider = "whisper-cpp"    # Local whisper.cpp (built during install)
-# provider = "whisper-rs"     # Warm in-process whisper.cpp bindings
+# provider = "whisper-rs"     # In-process whisper.cpp bindings
 # provider = "openai-cli"     # Local OpenAI Whisper CLI 
 # provider = "openai-api"     # OpenAI API (requires api_key)
 
@@ -24,7 +24,7 @@ language = "en"             # Language code (en, es, fr, de, etc.)
 
 # whisper-rs settings (used when provider = "whisper-rs")
 # model = "base.en"                         # Prefers ggml-base.en-q5_0.bin when present
-# keep_warm_for_secs = 300                  # Idle-unload after this many seconds
+# keep_warm_for_secs = 0                    # 0 (default) unloads after each recording; positive values retain the model between recordings
 # audio_ctx = "auto"                        # auto = shrink encoder context per clip; 0/"off" = full 30s window; integer = explicit context
 # initial_prompt = "Transcribe concise technical dictation."
 # coding_vocabulary = "Rust, Axum, Tokio, whisper-rs, ChezWizper"

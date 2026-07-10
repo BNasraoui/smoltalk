@@ -26,7 +26,7 @@ pub struct WhisperRsProvider {
     inner: Arc<Mutex<WhisperRsInner>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct WhisperRsOptions {
     pub threads: Option<u32>,
     pub beam_size: Option<u32>,
@@ -35,6 +35,20 @@ pub(crate) struct WhisperRsOptions {
     pub keep_warm_for_secs: Option<u64>,
     pub initial_prompt: Option<String>,
     pub audio_ctx: AudioCtxConfig,
+}
+
+impl Default for WhisperRsOptions {
+    fn default() -> Self {
+        Self {
+            threads: None,
+            beam_size: None,
+            best_of: None,
+            no_fallback: None,
+            keep_warm_for_secs: Some(0),
+            initial_prompt: None,
+            audio_ctx: AudioCtxConfig::Auto,
+        }
+    }
 }
 
 struct WhisperRsInner {
@@ -140,6 +154,9 @@ impl WarmModelState {
         let Some(keep_warm_for) = self.keep_warm_for else {
             return false;
         };
+        if keep_warm_for.is_zero() {
+            return false;
+        }
         let Some(last_used_at) = self.last_used_at else {
             return false;
         };
@@ -174,7 +191,7 @@ impl WhisperRsProvider {
 
         {
             let inner = self.inner.lock().unwrap();
-            if inner.context.is_some() {
+            if inner.context.is_some() && inner.whisper_state.is_some() {
                 return Ok(());
             }
         }
@@ -201,12 +218,18 @@ impl WhisperRsProvider {
         // flash attention only pays off on GPU backends.
         context_params.flash_attn(false);
 
-        let result =
-            WhisperContext::new_with_params(model_path, context_params).with_context(|| {
+        let result = WhisperContext::new_with_params(model_path, context_params)
+            .with_context(|| {
                 format!(
                     "failed to load whisper-rs model {}",
                     self.model_path.display()
                 )
+            })
+            .and_then(|context| {
+                let state = context
+                    .create_state()
+                    .context("failed to create whisper-rs state")?;
+                Ok((context, state))
             });
 
         bench_trace::event_with_extra("model_load_end", || {
@@ -220,9 +243,9 @@ impl WhisperRsProvider {
 
         let mut inner = self.inner.lock().unwrap();
         match result {
-            Ok(context) => {
+            Ok((context, whisper_state)) => {
                 inner.context = Some(context);
-                inner.whisper_state = None;
+                inner.whisper_state = Some(whisper_state);
                 inner.state.mark_warm();
                 Ok(())
             }
@@ -248,16 +271,6 @@ impl WhisperRsProvider {
         let samples = read_wav_samples(audio_path)?;
         let mut inner = self.inner.lock().unwrap();
         let text = {
-            if inner.whisper_state.is_none() {
-                let state = inner
-                    .context
-                    .as_ref()
-                    .context("whisper-rs model is not loaded")?
-                    .create_state()
-                    .context("failed to create whisper-rs state")?;
-                inner.whisper_state = Some(state);
-            }
-
             let params = self.full_params(language, samples.len());
             let state = inner
                 .whisper_state
@@ -359,6 +372,13 @@ impl TranscriptionProvider for WhisperRsProvider {
         inner.whisper_state = None;
         inner.context = None;
         inner.state.mark_unloaded(UnloadReason::Manual);
+        Ok(())
+    }
+
+    fn recording_complete(&self) -> Result<()> {
+        if self.options.keep_warm_for_secs == Some(0) {
+            self.unload_model()?;
+        }
         Ok(())
     }
 
@@ -519,6 +539,16 @@ mod tests {
     }
 
     #[test]
+    fn zero_duration_waits_for_recording_completion_to_unload() {
+        let mut state = WarmModelState::new(Some(Duration::ZERO));
+        let now = Instant::now();
+
+        state.mark_warm_at(now);
+
+        assert!(!state.should_idle_unload(now));
+    }
+
+    #[test]
     fn disabled_idle_timer_never_expires() {
         let mut state = WarmModelState::new(None);
         let now = Instant::now();
@@ -526,6 +556,50 @@ mod tests {
         state.mark_warm_at(now);
 
         assert!(!state.should_idle_unload(now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn options_default_to_releasing_the_model_between_recordings() {
+        assert_eq!(WhisperRsOptions::default().keep_warm_for_secs, Some(0));
+    }
+
+    #[test]
+    fn recording_completion_releases_the_default_cold_provider() {
+        let provider = WhisperRsProvider::new(
+            "base.en".to_string(),
+            Some("/tmp/missing-whisper-model.bin".to_string()),
+            WhisperRsOptions::default(),
+        )
+        .unwrap();
+        provider.inner.lock().unwrap().state.mark_warm();
+
+        provider.recording_complete().unwrap();
+
+        assert_eq!(
+            provider.inner.lock().unwrap().state.status(),
+            WhisperRsModelStatus::Cold
+        );
+    }
+
+    #[test]
+    fn recording_completion_retains_an_explicitly_warm_provider() {
+        let provider = WhisperRsProvider::new(
+            "base.en".to_string(),
+            Some("/tmp/missing-whisper-model.bin".to_string()),
+            WhisperRsOptions {
+                keep_warm_for_secs: Some(300),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        provider.inner.lock().unwrap().state.mark_warm();
+
+        provider.recording_complete().unwrap();
+
+        assert_eq!(
+            provider.inner.lock().unwrap().state.status(),
+            WhisperRsModelStatus::Warm
+        );
     }
 
     #[test]

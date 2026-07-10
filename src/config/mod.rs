@@ -166,7 +166,7 @@ impl Default for WhisperConfig {
             best_of: None,
             no_fallback: None,
             timeout_secs: None,
-            keep_warm_for_secs: Some(300),
+            keep_warm_for_secs: Some(0),
             initial_prompt: None,
             coding_vocabulary: None,
             audio_ctx: AudioCtxConfig::Auto,
@@ -294,6 +294,20 @@ mod tests {
         let config: Config = toml::from_str("[api]\nport = 4848\n").unwrap();
 
         assert_eq!(config.api.port, 4848);
+    }
+
+    #[test]
+    fn whisper_defaults_to_releasing_the_model_between_recordings() {
+        let config: Config = toml::from_str("[audio]\ndevice = \"default\"\n").unwrap();
+
+        assert_eq!(config.whisper.keep_warm_for_secs, Some(0));
+    }
+
+    #[test]
+    fn whisper_honors_explicit_positive_keep_warm_duration() {
+        let config: Config = toml::from_str("[whisper]\nkeep_warm_for_secs = 300\n").unwrap();
+
+        assert_eq!(config.whisper.keep_warm_for_secs, Some(300));
     }
 
     #[test]

@@ -14,7 +14,7 @@ smoltalk instead keeps the small single-daemon design and focuses on transcripti
 
 ## Differences from upstream
 
-The upstream design spawns `whisper-cli` and reloads the model from disk for every utterance. smoltalk adds a `whisper-rs` provider that loads the model once and keeps it in memory (~150 MB for base.en). Measured with the bundled harness (30 phrases × 3 trials, same machine):
+The upstream design spawns `whisper-cli` and reloads the model from disk for every utterance. smoltalk adds an in-process `whisper-rs` provider. By default it starts capture first, prepares the model while you speak, and releases its roughly 166 MiB incremental memory when the recording finishes. Positive `keep_warm_for_secs` values retain the model between recordings. With retention enabled, the bundled harness measured the following results (30 phrases × 3 trials, same machine):
 
 | | whisper-cli subprocess | warm whisper-rs |
 |---|---|---|
@@ -32,7 +32,7 @@ Other changes since the fork:
 ## Features
 
 - Keybind toggle and push-to-talk recording
-- Local transcription via whisper-rs (warm, in-process); whisper.cpp CLI, OpenAI CLI, and OpenAI API providers also available
+- Local transcription via whisper-rs (in-process and cold while idle by default); whisper.cpp CLI, OpenAI CLI, and OpenAI API providers also available
 - Text injection with clipboard preservation
 - Visual recording indicators and Waybar integration
 - Single TOML config
@@ -57,13 +57,15 @@ This installs dependencies, builds with optimized Whisper, sets up services, and
    bindrd = , mouse:276, smoltalk stop,  exec, curl -fsS -X POST http://127.0.0.1:3737/stop
    ```
 
-For the warm provider, set in `~/.config/chezwizper/config.toml`:
+For the in-process provider, set in `~/.config/chezwizper/config.toml`:
 
 ```toml
 [whisper]
 provider = "whisper-rs"
 model = "base.en"
 ```
+
+This uses the cold-at-idle default. To retain the model between recordings, add a positive duration such as `keep_warm_for_secs = 300`.
 
 ## Manual Installation
 

@@ -115,8 +115,10 @@ async fn main() -> Result<()> {
 
     // Compose transcription service with whisper and normalizer
     let transcription_service = Arc::new(TranscriptionService::new(whisper)?);
-    if let Err(e) = transcription_service.prepare().await {
-        error!("Transcription provider preload failed: {}", e);
+    if config.whisper.keep_warm_for_secs != Some(0) {
+        if let Err(e) = transcription_service.prepare().await {
+            error!("Transcription provider preload failed: {}", e);
+        }
     }
 
     let text_injector =
@@ -166,8 +168,11 @@ async fn main() -> Result<()> {
                     error!("Failed to show recording indicator: {}", e);
                 }
 
-                let audio_recorder = state.audio_recorder.lock().await;
-                if let Err(e) = audio_recorder.start_recording().await {
+                let start_result = {
+                    let audio_recorder = state.audio_recorder.lock().await;
+                    audio_recorder.start_recording().await
+                };
+                if let Err(e) = start_result {
                     error!("Failed to start recording: {}", e);
                     bench_trace::event_with_extra("trial_error", || {
                         serde_json::json!({
@@ -180,16 +185,25 @@ async fn main() -> Result<()> {
                     let _ = indicator
                         .show_error(&format!("Recording failed: {e}"))
                         .await;
-                } else if config.chunking.enabled && transcription_service.supports_chunking() {
-                    chunking_session = Some(PauseChunkingSession::start(
-                        &config.chunking,
-                        &config.vad,
-                        audio_recorder.sample_rate(),
-                        audio_recorder.recording_buffer(),
-                        transcription_service.clone(),
-                    ));
-                } else if config.chunking.enabled {
-                    tracing::warn!("Pause chunking is only supported by the whisper-rs provider");
+                } else {
+                    if let Err(e) = transcription_service.prepare().await {
+                        error!("Transcription provider preparation failed: {}", e);
+                    }
+
+                    if config.chunking.enabled && transcription_service.supports_chunking() {
+                        let audio_recorder = state.audio_recorder.lock().await;
+                        chunking_session = Some(PauseChunkingSession::start(
+                            &config.chunking,
+                            &config.vad,
+                            audio_recorder.sample_rate(),
+                            audio_recorder.recording_buffer(),
+                            transcription_service.clone(),
+                        ));
+                    } else if config.chunking.enabled {
+                        tracing::warn!(
+                            "Pause chunking is only supported by the whisper-rs provider"
+                        );
+                    }
                 }
             }
             ApiCommand::StopRecording(source) => {
@@ -316,6 +330,10 @@ async fn main() -> Result<()> {
                             .show_error(&format!("Failed to save audio: {e}"))
                             .await;
                     }
+                }
+
+                if let Err(e) = transcription_service.recording_complete() {
+                    error!("Failed to complete transcription provider lifecycle: {}", e);
                 }
 
                 *state.status.lock().await = AppStatus::Idle;

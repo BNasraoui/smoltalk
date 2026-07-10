@@ -9,7 +9,7 @@ Welcome to the smoltalk documentation. smoltalk is a lean, latency-first voice d
 ### Installation & Setup
 
 - [Installation Guide](./installation.md) — complete installation instructions
-- [Configuration Guide](./configuration.md) — full configuration reference: providers (including the warm `whisper-rs` provider), audio, injection, API, UI, and behavior
+- [Configuration Guide](./configuration.md) — full configuration reference: providers (including the in-process `whisper-rs` provider), audio, injection, API, UI, and behavior
 - [Text Injection Setup](./text-injection-setup.md) — how hybrid injection works and how to set up injection tools
 - [Waybar Integration](./waybar-integration.md) — status indicators in your Waybar
 

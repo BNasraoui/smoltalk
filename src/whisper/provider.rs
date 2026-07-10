@@ -36,6 +36,10 @@ pub trait TranscriptionProvider: Send + Sync {
         ))
     }
 
+    fn recording_complete(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn reload_model<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             self.unload_model()?;
