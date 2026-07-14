@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
 
+mod process;
 pub mod provider;
 mod providers;
 
@@ -110,33 +111,11 @@ impl WhisperTranscriber {
         ))
     }
 
-    #[allow(dead_code)] // main.rs compiles this module separately and uses the sample route.
-    pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
-        info!(
-            "Transcribing audio file: {:?} with {}",
-            audio_path,
-            self.provider.name()
-        );
-        bench_trace::event_with_extra("provider_transcription_begin", || {
-            serde_json::json!({
-                "audio_path": audio_path.display().to_string(),
-                "provider": self.provider.name(),
-                "language": self.language.as_str(),
-            })
-        });
-        let result = self
-            .provider
-            .transcribe(audio_path.as_path(), &self.language)
-            .await;
-
-        self.trace_transcription_result(&result);
-        result
-    }
-
     pub async fn transcribe_samples(
         &self,
         samples: &[f32],
         retention: AudioFileRetention,
+        cancellation: CancellationToken,
     ) -> Result<String> {
         info!(
             "Transcribing {} in-memory samples with {}",
@@ -153,14 +132,18 @@ impl WhisperTranscriber {
         });
         let result = self
             .provider
-            .transcribe_samples(samples, &self.language, retention)
+            .transcribe_samples(samples, &self.language, retention, cancellation.clone())
             .await;
 
-        self.trace_transcription_result(&result);
+        self.trace_transcription_result(&result, &cancellation);
         result
     }
 
-    fn trace_transcription_result(&self, result: &Result<String>) {
+    fn trace_transcription_result(
+        &self,
+        result: &Result<String>,
+        cancellation: &CancellationToken,
+    ) {
         match &result {
             Ok(text) => bench_trace::event_with_extra("provider_transcription_end", || {
                 serde_json::json!({
@@ -168,13 +151,22 @@ impl WhisperTranscriber {
                     "text_chars": text.len(),
                 })
             }),
-            Err(error) => bench_trace::event_with_extra("trial_error", || {
-                serde_json::json!({
-                    "phase": "provider_transcription",
-                    "provider": self.provider.name(),
-                    "error": error.to_string(),
-                })
-            }),
+            Err(error) => {
+                let event = transcription_trace_event(result, cancellation);
+                bench_trace::event_with_extra(event, || {
+                    if event == "trial_error" {
+                        serde_json::json!({
+                            "phase": "provider_transcription",
+                            "provider": self.provider.name(),
+                            "error": error.to_string(),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "provider": self.provider.name(),
+                        })
+                    }
+                });
+            }
         }
     }
 
@@ -204,6 +196,17 @@ impl WhisperTranscriber {
 
     pub fn is_openai_whisper(&self) -> bool {
         self.provider.name() == "OpenAI Whisper CLI"
+    }
+}
+
+fn transcription_trace_event(
+    result: &Result<String>,
+    cancellation: &CancellationToken,
+) -> &'static str {
+    match result {
+        Ok(_) => "provider_transcription_end",
+        Err(_) if cancellation.is_cancelled() => "provider_transcription_cancelled",
+        Err(_) => "trial_error",
     }
 }
 
@@ -401,6 +404,7 @@ mod tests {
             &'a self,
             _audio_path: &'a Path,
             _language: &'a str,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             panic!("sample facade must not call the path transcription route")
         }
@@ -410,6 +414,7 @@ mod tests {
             samples: &'a [f32],
             language: &'a str,
             retention: AudioFileRetention,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             Box::pin(async move {
                 *self.observed.lock().unwrap() = Some(ObservedSamples {
@@ -494,6 +499,18 @@ mod tests {
         assert!(transcriber.supports_chunking());
     }
 
+    #[test]
+    fn cancelled_transcription_is_not_traced_as_a_trial_error() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = Err(anyhow::anyhow!("transcription cancelled"));
+
+        assert_eq!(
+            transcription_trace_event(&result, &cancellation),
+            "provider_transcription_cancelled"
+        );
+    }
+
     #[tokio::test]
     async fn sample_facade_forwards_slice_language_and_retention_to_provider_override() {
         let observed = Arc::new(Mutex::new(None));
@@ -506,7 +523,7 @@ mod tests {
         let samples = [0.25, -0.5, 0.75];
 
         let text = transcriber
-            .transcribe_samples(&samples, AudioFileRetention::Keep)
+            .transcribe_samples(&samples, AudioFileRetention::Keep, CancellationToken::new())
             .await
             .unwrap();
 

@@ -45,7 +45,7 @@ audio_ctx = "auto"              # whisper-rs: shrink encoder context to clip len
 # api_endpoint = "https://api.openai.com/v1/audio/transcriptions"  # openai-api only
 
 [api]
-port = 3737                     # Local HTTP API port (toggle/start/stop/status)
+port = 3737                     # Local HTTP API port (toggle/start/stop/cancel/status)
 
 [injection]
 restore_clipboard = true        # Restore previous clipboard after a paste injection
@@ -246,7 +246,7 @@ Chunking adds sustained CPU load while recording. Benchmark the `[whisper] threa
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `port` | number | `3737` | Local HTTP port for `/toggle`, `/start`, `/stop`, and `/status`. Change it to run a second instance (the benchmark harness uses 3838) |
+| `port` | number | `3737` | Local HTTP port for `/toggle`, `/start`, `/stop`, `/cancel`, and `/status`. Change it to run a second instance (the benchmark harness uses 3838) |
 
 ### [behavior] - Application Behavior
 
@@ -257,7 +257,7 @@ Controls how smoltalk handles transcribed text and temporary files.
 | `auto_paste` | bool | `true` | Automatically paste/type transcribed text |
 | `preserve_clipboard` | bool | `false` | Keep existing clipboard content when using clipboard injection |
 | `delete_audio_files` | bool | `true` | Delete temporary audio recordings after processing |
-| `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop recording) |
+| `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop/cancel recording) |
 
 ## Configuration File Location
 

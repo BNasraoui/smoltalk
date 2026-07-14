@@ -46,6 +46,7 @@ The daemon listens on `127.0.0.1:3737` by default (configurable via `[api] port`
 | `/toggle` | POST | Toggle recording (start if idle, stop-and-transcribe if recording) |
 | `/start` | POST | Start recording (idempotent; no-op unless idle) — for push-to-talk press |
 | `/stop` | POST | Stop and transcribe (idempotent; no-op unless recording) — for push-to-talk release |
+| `/cancel` | POST | Discard the active recording or interrupt pending transcription; no-op when idle |
 | `/status` | GET | JSON status: `{"recording": bool, "status": "idle\|recording\|processing"}` |
 
 ## Quick Links

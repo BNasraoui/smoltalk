@@ -1,6 +1,8 @@
 pub mod api;
+pub mod app;
 pub mod audio;
 pub mod bench_trace;
+pub mod cancellation;
 pub mod chunking;
 pub mod clipboard;
 pub mod config;

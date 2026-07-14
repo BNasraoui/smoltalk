@@ -24,14 +24,14 @@ The upstream design spawns `whisper-cli` and reloads the model from disk for eve
 
 Other changes since the fork:
 
-- Explicit `POST /start` / `POST /stop` endpoints for push-to-talk (bind press/release on a key or mouse button), alongside the original `/toggle`
+- Explicit `POST /start` / `POST /stop` endpoints for push-to-talk, plus `POST /cancel` to discard the current recording or interrupt a pending transcription
 - Hybrid text injection: single-line text is typed directly without touching the clipboard; multiline text uses a paste transaction that restores the previous clipboard afterwards
 - Latency trace instrumentation (`CHEZWIZPER_BENCH_TRACE`) and a benchmark harness under `bench/`
 - Configurable API port (`[api] port`), so a benchmark instance can run alongside the live service
 
 ## Features
 
-- Keybind toggle and push-to-talk recording
+- Keybind toggle and push-to-talk recording with preemptible cancellation
 - Local transcription via whisper-rs (in-process and cold while idle by default); whisper.cpp CLI, OpenAI CLI, and OpenAI API providers also available
 - Default model lifecycle: approximately 250 MiB PSS while loaded and 54 MiB after unloading on the test machine
 - Text injection with clipboard preservation
@@ -52,11 +52,14 @@ This installs dependencies, builds with optimized Whisper, sets up services, and
 1. Start the service: `make start`
 2. Toggle mode — add to your Hyprland config:
    `bindd = SUPER, R, smoltalk, exec, curl -X POST http://127.0.0.1:3737/toggle`
-3. Or push-to-talk — bind press to `/start` and release to `/stop`:
+3. Or push-to-talk — bind press to `/start`, release to `/stop`, and another button to `/cancel`:
    ```
    bindd  = , mouse:276, smoltalk start, exec, curl -fsS -X POST http://127.0.0.1:3737/start
    bindrd = , mouse:276, smoltalk stop,  exec, curl -fsS -X POST http://127.0.0.1:3737/stop
+   bindd  = , mouse:277, smoltalk cancel, exec, curl -fsS -X POST http://127.0.0.1:3737/cancel
    ```
+
+   Replace `mouse:277` with the button you want to use for cancellation. It can be pressed while recording or after release while transcription is processing. A cancelled utterance is never injected, and a new `/start` can be issued immediately.
 
 For the in-process provider, set in `~/.config/chezwizper/config.toml`:
 

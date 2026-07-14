@@ -1,4 +1,5 @@
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
 use crate::config::{Config, WaybarConfig};
 use crate::transcription::TranscriptionService;
 use anyhow::Result;
@@ -17,9 +18,10 @@ use tower::ServiceBuilder;
 use tracing::{error, info};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ApiCommand {
-    StartRecording(ApiCommandSource),
-    StopRecording(ApiCommandSource),
+pub enum RecordingCommand {
+    Start(ApiCommandSource, CancellationToken),
+    Stop(ApiCommandSource, CancellationToken),
+    Cancel(CancellationToken),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,33 +38,81 @@ pub enum AppStatus {
     Processing,
 }
 
-pub(crate) type SharedAppStatus = Arc<Mutex<AppStatus>>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AppLifecycle {
+    Idle,
+    Recording(CancellationToken),
+    Processing(CancellationToken),
+}
 
-pub(crate) fn lock_app_status(status: &SharedAppStatus) -> MutexGuard<'_, AppStatus> {
-    status
+impl AppLifecycle {
+    pub(crate) fn status(&self) -> AppStatus {
+        match self {
+            Self::Idle => AppStatus::Idle,
+            Self::Recording(_) => AppStatus::Recording,
+            Self::Processing(_) => AppStatus::Processing,
+        }
+    }
+}
+
+pub(crate) type SharedAppLifecycle = Arc<Mutex<AppLifecycle>>;
+
+pub(crate) fn lock_lifecycle(lifecycle: &SharedAppLifecycle) -> MutexGuard<'_, AppLifecycle> {
+    lifecycle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[allow(dead_code)] // main.rs compiles this module separately from the library crate.
-pub(crate) struct ProcessingResetGuard {
-    status: SharedAppStatus,
+pub(crate) fn release_recording_reservation(
+    lifecycle: &SharedAppLifecycle,
+    cancellation: &CancellationToken,
+) {
+    let mut lifecycle = lock_lifecycle(lifecycle);
+    let owns_current = matches!(
+        &*lifecycle,
+        AppLifecycle::Recording(current) if current.same_session(cancellation)
+    );
+
+    if owns_current {
+        *lifecycle = AppLifecycle::Idle;
+        bench_trace::event("state_idle_set");
+    }
 }
 
-#[allow(dead_code)]
+pub(crate) struct ProcessingResetGuard {
+    lifecycle: SharedAppLifecycle,
+    cancellation: CancellationToken,
+}
+
 impl ProcessingResetGuard {
-    pub(crate) fn new(status: SharedAppStatus) -> Self {
-        Self { status }
+    pub(crate) fn new(lifecycle: SharedAppLifecycle, cancellation: CancellationToken) -> Self {
+        Self {
+            lifecycle,
+            cancellation,
+        }
     }
 }
 
 impl Drop for ProcessingResetGuard {
     fn drop(&mut self) {
-        {
-            let mut status = lock_app_status(&self.status);
-            *status = AppStatus::Idle;
+        let reset = {
+            let mut lifecycle = lock_lifecycle(&self.lifecycle);
+            let owns_current = matches!(
+                &*lifecycle,
+                AppLifecycle::Processing(current)
+                    if current.same_session(&self.cancellation)
+            );
+
+            if owns_current {
+                *lifecycle = AppLifecycle::Idle;
+                true
+            } else {
+                false
+            }
+        };
+        if reset {
+            bench_trace::event("state_idle_set");
         }
-        bench_trace::event("state_idle_set");
     }
 }
 
@@ -78,21 +128,21 @@ impl AppStatus {
 
 #[derive(Clone)]
 pub struct AppState {
-    tx: mpsc::Sender<ApiCommand>,
-    status: SharedAppStatus,
+    tx: mpsc::Sender<RecordingCommand>,
+    lifecycle: SharedAppLifecycle,
     waybar_config: WaybarConfig,
     transcription: Arc<TranscriptionService>,
 }
 
-pub struct ApiServer {
+pub(crate) struct ApiServer {
     port: u16,
     state: AppState,
 }
 
 impl ApiServer {
-    pub fn new(
-        tx: mpsc::Sender<ApiCommand>,
-        status: SharedAppStatus,
+    pub(crate) fn new(
+        tx: mpsc::Sender<RecordingCommand>,
+        lifecycle: SharedAppLifecycle,
         config: &Config,
         transcription: Arc<TranscriptionService>,
     ) -> Self {
@@ -100,18 +150,19 @@ impl ApiServer {
             port: config.api.port,
             state: AppState {
                 tx,
-                status,
+                lifecycle,
                 waybar_config: config.ui.waybar.clone(),
                 transcription,
             },
         }
     }
 
-    pub async fn start(self) -> Result<()> {
+    pub(crate) async fn start(self) -> Result<()> {
         let app = Router::new()
             .route("/", get(status))
             .route("/start", post(start_recording))
             .route("/stop", post(stop_recording))
+            .route("/cancel", post(cancel_recording))
             .route("/toggle", post(toggle_recording))
             .route("/status", get(recording_status))
             .route("/model/status", get(model_status))
@@ -126,6 +177,7 @@ impl ApiServer {
         info!("Endpoints:");
         info!("  POST /start  - Start recording");
         info!("  POST /stop   - Stop recording");
+        info!("  POST /cancel - Cancel the current utterance");
         info!("  POST /toggle - Toggle recording");
         info!("  GET /status  - Get recording and model status");
 
@@ -158,41 +210,45 @@ pub(crate) struct ReservationOutcome {
 }
 
 pub(crate) async fn reserve_recording_command(
-    tx: &mpsc::Sender<ApiCommand>,
-    status: &SharedAppStatus,
+    tx: &mpsc::Sender<RecordingCommand>,
+    lifecycle: &SharedAppLifecycle,
     request: RecordingRequest,
 ) -> Result<ReservationOutcome, StatusCode> {
-    let mut current_status = lock_app_status(status);
-    let command = match (request, *current_status) {
-        (RecordingRequest::Start | RecordingRequest::Toggle, AppStatus::Idle) => {
-            *current_status = AppStatus::Recording;
+    let mut lifecycle = lock_lifecycle(lifecycle);
+    let command = match (request, lifecycle.clone()) {
+        (RecordingRequest::Start | RecordingRequest::Toggle, AppLifecycle::Idle) => {
+            let cancellation = CancellationToken::new();
+            *lifecycle = AppLifecycle::Recording(cancellation.clone());
             bench_trace::event("state_recording_set");
             Some((
-                ApiCommand::StartRecording(request.command_source()),
-                AppStatus::Idle,
+                RecordingCommand::Start(request.command_source(), cancellation),
+                AppLifecycle::Idle,
             ))
         }
-        (RecordingRequest::Stop | RecordingRequest::Toggle, AppStatus::Recording) => {
-            *current_status = AppStatus::Processing;
+        (
+            RecordingRequest::Stop | RecordingRequest::Toggle,
+            AppLifecycle::Recording(cancellation),
+        ) => {
+            *lifecycle = AppLifecycle::Processing(cancellation.clone());
             bench_trace::event("state_processing_set");
             Some((
-                ApiCommand::StopRecording(request.command_source()),
-                AppStatus::Recording,
+                RecordingCommand::Stop(request.command_source(), cancellation.clone()),
+                AppLifecycle::Recording(cancellation),
             ))
         }
         _ => None,
     };
 
-    if let Some((command, rollback_status)) = command {
+    if let Some((command, rollback_state)) = command {
         if let Err(e) = tx.try_send(command) {
             error!("Failed to send recording command: {}", e);
-            *current_status = rollback_status;
+            *lifecycle = rollback_state;
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
-    let success =
-        !(request == RecordingRequest::Toggle && *current_status == AppStatus::Processing);
+    let status = lifecycle.status();
+    let success = !(request == RecordingRequest::Toggle && status == AppStatus::Processing);
     let message = match request {
         RecordingRequest::Start => "Recording started",
         RecordingRequest::Stop => "Recording stopped",
@@ -203,7 +259,43 @@ pub(crate) async fn reserve_recording_command(
     Ok(ReservationOutcome {
         success,
         message,
-        status: *current_status,
+        status,
+    })
+}
+
+pub(crate) async fn reserve_cancel_command(
+    tx: &mpsc::Sender<RecordingCommand>,
+    lifecycle: &SharedAppLifecycle,
+) -> Result<ReservationOutcome, StatusCode> {
+    let mut lifecycle = lock_lifecycle(lifecycle);
+    let mut success = true;
+    let mut message = "Recording cancelled";
+
+    match lifecycle.clone() {
+        AppLifecycle::Recording(cancellation) => {
+            if let Err(e) = tx.try_send(RecordingCommand::Cancel(cancellation.clone())) {
+                error!("Failed to send cancel command: {}", e);
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            cancellation.cancel();
+            *lifecycle = AppLifecycle::Idle;
+        }
+        AppLifecycle::Processing(cancellation) => {
+            if cancellation.cancel() {
+                *lifecycle = AppLifecycle::Idle;
+            } else {
+                success = false;
+                message = "Text insertion has already started";
+            }
+        }
+        AppLifecycle::Idle => {}
+    }
+
+    let status = lifecycle.status();
+    Ok(ReservationOutcome {
+        success,
+        message,
+        status,
     })
 }
 
@@ -218,7 +310,7 @@ impl RecordingRequest {
 }
 
 async fn start_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let status = *lock_app_status(&state.status);
+    let status = lock_lifecycle(&state.lifecycle).status();
     bench_trace::event_with_extra("api_start_received", || {
         json!({
             "status": status.as_str(),
@@ -226,7 +318,7 @@ async fn start_recording(State(state): State<AppState>) -> Result<Json<Value>, S
     });
 
     let outcome =
-        reserve_recording_command(&state.tx, &state.status, RecordingRequest::Start).await?;
+        reserve_recording_command(&state.tx, &state.lifecycle, RecordingRequest::Start).await?;
 
     info!("Start recording command received via API");
     Ok(Json(json!({
@@ -237,7 +329,7 @@ async fn start_recording(State(state): State<AppState>) -> Result<Json<Value>, S
 }
 
 async fn stop_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let status = *lock_app_status(&state.status);
+    let status = lock_lifecycle(&state.lifecycle).status();
     bench_trace::event_with_extra("api_stop_received", || {
         json!({
             "status": status.as_str(),
@@ -245,7 +337,7 @@ async fn stop_recording(State(state): State<AppState>) -> Result<Json<Value>, St
     });
 
     let outcome =
-        reserve_recording_command(&state.tx, &state.status, RecordingRequest::Stop).await?;
+        reserve_recording_command(&state.tx, &state.lifecycle, RecordingRequest::Stop).await?;
 
     info!("Stop recording command received via API");
     Ok(Json(json!({
@@ -255,8 +347,26 @@ async fn stop_recording(State(state): State<AppState>) -> Result<Json<Value>, St
     })))
 }
 
+async fn cancel_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let status = lock_lifecycle(&state.lifecycle).status();
+    bench_trace::event_with_extra("api_cancel_received", || {
+        json!({
+            "status": status.as_str(),
+        })
+    });
+
+    let outcome = reserve_cancel_command(&state.tx, &state.lifecycle).await?;
+
+    info!("Cancel recording command received via API");
+    Ok(Json(json!({
+        "success": outcome.success,
+        "message": outcome.message,
+        "status": outcome.status.as_str(),
+    })))
+}
+
 async fn toggle_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let status = *lock_app_status(&state.status);
+    let status = lock_lifecycle(&state.lifecycle).status();
     bench_trace::event_with_extra("api_toggle_received", || {
         json!({
             "status": status.as_str(),
@@ -264,7 +374,7 @@ async fn toggle_recording(State(state): State<AppState>) -> Result<Json<Value>, 
     });
 
     let outcome =
-        reserve_recording_command(&state.tx, &state.status, RecordingRequest::Toggle).await?;
+        reserve_recording_command(&state.tx, &state.lifecycle, RecordingRequest::Toggle).await?;
 
     info!("Toggle recording command received via API");
     if !outcome.success {
@@ -285,7 +395,7 @@ async fn recording_status(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> Json<Value> {
-    let status = *lock_app_status(&state.status);
+    let status = lock_lifecycle(&state.lifecycle).status();
 
     // Check if waybar style is requested
     if params.get("style") == Some(&"waybar".to_string()) {
@@ -354,7 +464,26 @@ fn generate_waybar_response(status: AppStatus, config: &WaybarConfig) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
     use tokio::sync::mpsc::error::TryRecvError;
+
+    fn lifecycle_token(lifecycle: &AppLifecycle) -> Option<&CancellationToken> {
+        match lifecycle {
+            AppLifecycle::Idle => None,
+            AppLifecycle::Recording(cancellation) | AppLifecycle::Processing(cancellation) => {
+                Some(cancellation)
+            }
+        }
+    }
+
+    #[test]
+    fn recording_lifecycle_owns_its_utterance_token() {
+        let cancellation = CancellationToken::new();
+        let lifecycle = AppLifecycle::Recording(cancellation.clone());
+
+        assert_eq!(lifecycle.status(), AppStatus::Recording);
+        assert!(lifecycle_token(&lifecycle).is_some_and(|token| token.same_session(&cancellation)));
+    }
 
     #[test]
     fn waybar_response_reports_processing_state() {
@@ -369,223 +498,415 @@ mod tests {
 
     #[test]
     fn processing_reset_guard_restores_idle() {
-        let status: SharedAppStatus = Arc::new(std::sync::Mutex::new(AppStatus::Processing));
+        let cancellation = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(cancellation.clone())));
 
         {
-            let _guard = ProcessingResetGuard::new(status.clone());
+            let _guard = ProcessingResetGuard::new(lifecycle.clone(), cancellation);
         }
 
-        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
+        assert_eq!(*lock_lifecycle(&lifecycle), AppLifecycle::Idle);
     }
 
     #[test]
-    fn app_status_lock_recovers_after_poisoning() {
-        let status: SharedAppStatus = Arc::new(std::sync::Mutex::new(AppStatus::Processing));
-        let panic_status = status.clone();
+    fn processing_reset_guard_does_not_overwrite_a_new_recording() {
+        let old = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(old.clone())));
+        let replacement = CancellationToken::new();
+
+        {
+            let _guard = ProcessingResetGuard::new(lifecycle.clone(), old);
+            *lock_lifecycle(&lifecycle) = AppLifecycle::Recording(replacement.clone());
+        }
+
+        assert!(matches!(
+            &*lock_lifecycle(&lifecycle),
+            AppLifecycle::Recording(current) if current.same_session(&replacement)
+        ));
+    }
+
+    #[test]
+    fn processing_reset_guard_does_not_overwrite_new_processing_session() {
+        let old = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(old.clone())));
+        let replacement = CancellationToken::new();
+
+        {
+            let _guard = ProcessingResetGuard::new(lifecycle.clone(), old);
+            *lock_lifecycle(&lifecycle) = AppLifecycle::Processing(replacement.clone());
+        }
+
+        assert!(matches!(
+            &*lock_lifecycle(&lifecycle),
+            AppLifecycle::Processing(current) if current.same_session(&replacement)
+        ));
+    }
+
+    #[test]
+    fn app_lifecycle_lock_recovers_after_poisoning() {
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
+        let panic_lifecycle = lifecycle.clone();
 
         let _ = std::panic::catch_unwind(move || {
-            let _status = panic_status.lock().expect("status should start unpoisoned");
-            panic!("poison status mutex");
+            let _state = panic_lifecycle
+                .lock()
+                .expect("lifecycle should start unpoisoned");
+            panic!("poison lifecycle mutex");
         });
 
-        *lock_app_status(&status) = AppStatus::Idle;
+        *lock_lifecycle(&lifecycle) = AppLifecycle::Idle;
 
-        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
+        assert_eq!(*lock_lifecycle(&lifecycle), AppLifecycle::Idle);
     }
 
     #[tokio::test]
     async fn start_from_idle_reserves_recording_and_enqueues_start() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Idle));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Start)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start)
             .await
             .expect("start should enqueue");
 
         assert_eq!(outcome.status, AppStatus::Recording);
-        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
-        assert_eq!(
-            rx.recv().await,
-            Some(ApiCommand::StartRecording(ApiCommandSource::Start))
-        );
+        let state = lifecycle.lock().unwrap().clone();
+        let cancellation = lifecycle_token(&state).unwrap().clone();
+        assert_eq!(state.status(), AppStatus::Recording);
+        match rx.recv().await {
+            Some(RecordingCommand::Start(ApiCommandSource::Start, queued)) => {
+                assert!(queued.same_session(&cancellation));
+            }
+            other => panic!("expected start command, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn start_from_recording_is_idempotent_without_enqueue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Recording));
+        let lifecycle = Arc::new(Mutex::new(
+            AppLifecycle::Recording(CancellationToken::new()),
+        ));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Start)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start)
             .await
             .expect("duplicate start should be accepted");
 
         assert_eq!(outcome.status, AppStatus::Recording);
-        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Recording);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]
     async fn start_from_processing_is_idempotent_without_enqueue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Processing));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(
+            CancellationToken::new(),
+        )));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Start)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start)
             .await
             .expect("start during processing should be accepted as a no-op");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Processing);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]
     async fn stop_from_recording_reserves_processing_and_enqueues_stop() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Recording));
+        let cancellation = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Recording(cancellation.clone())));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Stop)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Stop)
             .await
             .expect("stop should enqueue");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Processing);
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StopRecording(ApiCommandSource::Stop))
+            Some(RecordingCommand::Stop(ApiCommandSource::Stop, cancellation))
         );
     }
 
     #[tokio::test]
     async fn stop_from_idle_is_idempotent_without_enqueue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Idle));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Stop)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Stop)
             .await
             .expect("stop from idle should be accepted as a no-op");
 
         assert_eq!(outcome.status, AppStatus::Idle);
-        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
+        assert_eq!(*lock_lifecycle(&lifecycle), AppLifecycle::Idle);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]
     async fn stop_from_processing_is_idempotent_without_enqueue() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Processing));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(
+            CancellationToken::new(),
+        )));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Stop)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Stop)
             .await
             .expect("stop during processing should be accepted as a no-op");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Processing);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]
     async fn toggle_from_idle_uses_start_reservation() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Idle));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Toggle)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Toggle)
             .await
             .expect("toggle from idle should enqueue start");
 
         assert_eq!(outcome.status, AppStatus::Recording);
-        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
+        let cancellation = lifecycle_token(&lock_lifecycle(&lifecycle))
+            .unwrap()
+            .clone();
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StartRecording(ApiCommandSource::Toggle))
+            Some(RecordingCommand::Start(
+                ApiCommandSource::Toggle,
+                cancellation
+            ))
         );
     }
 
     #[tokio::test]
     async fn toggle_from_recording_uses_stop_reservation() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Recording));
+        let cancellation = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Recording(cancellation.clone())));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Toggle)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Toggle)
             .await
             .expect("toggle from recording should enqueue stop");
 
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Processing);
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StopRecording(ApiCommandSource::Toggle))
+            Some(RecordingCommand::Stop(
+                ApiCommandSource::Toggle,
+                cancellation
+            ))
         );
     }
 
     #[tokio::test]
     async fn toggle_from_processing_preserves_existing_no_enqueue_response() {
         let (tx, mut rx) = mpsc::channel(1);
-        let status = Arc::new(Mutex::new(AppStatus::Processing));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(
+            CancellationToken::new(),
+        )));
 
-        let outcome = reserve_recording_command(&tx, &status, RecordingRequest::Toggle)
+        let outcome = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Toggle)
             .await
             .expect("toggle during processing should return the existing API response");
 
         assert!(!outcome.success);
         assert_eq!(outcome.status, AppStatus::Processing);
-        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Processing);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]
     async fn fast_start_then_stop_preserves_queue_order() {
         let (tx, mut rx) = mpsc::channel(2);
-        let status = Arc::new(Mutex::new(AppStatus::Idle));
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
 
-        reserve_recording_command(&tx, &status, RecordingRequest::Start)
+        reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start)
             .await
             .expect("start should enqueue");
-        reserve_recording_command(&tx, &status, RecordingRequest::Stop)
+        reserve_recording_command(&tx, &lifecycle, RecordingRequest::Stop)
             .await
             .expect("stop should enqueue before start is consumed");
 
-        assert_eq!(*lock_app_status(&status), AppStatus::Processing);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Processing);
+        let cancellation = lifecycle_token(&lock_lifecycle(&lifecycle))
+            .unwrap()
+            .clone();
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StartRecording(ApiCommandSource::Start))
+            Some(RecordingCommand::Start(
+                ApiCommandSource::Start,
+                cancellation.clone()
+            ))
         );
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StopRecording(ApiCommandSource::Stop))
+            Some(RecordingCommand::Stop(ApiCommandSource::Stop, cancellation))
         );
     }
 
     #[tokio::test]
     async fn channel_full_on_start_rolls_status_back_to_idle() {
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(ApiCommand::StopRecording(ApiCommandSource::Stop))
-            .expect("pre-fill command queue");
-        let status = Arc::new(Mutex::new(AppStatus::Idle));
+        let queued = CancellationToken::new();
+        tx.try_send(RecordingCommand::Stop(
+            ApiCommandSource::Stop,
+            queued.clone(),
+        ))
+        .expect("pre-fill command queue");
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
 
-        let result = reserve_recording_command(&tx, &status, RecordingRequest::Start).await;
+        let result = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start).await;
 
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(*lock_app_status(&status), AppStatus::Idle);
+        assert_eq!(*lock_lifecycle(&lifecycle), AppLifecycle::Idle);
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StopRecording(ApiCommandSource::Stop))
+            Some(RecordingCommand::Stop(ApiCommandSource::Stop, queued))
         );
     }
 
     #[tokio::test]
     async fn channel_full_on_stop_rolls_status_back_to_recording() {
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(ApiCommand::StartRecording(ApiCommandSource::Start))
-            .expect("pre-fill command queue");
-        let status = Arc::new(Mutex::new(AppStatus::Recording));
+        let queued = CancellationToken::new();
+        tx.try_send(RecordingCommand::Start(
+            ApiCommandSource::Start,
+            queued.clone(),
+        ))
+        .expect("pre-fill command queue");
+        let cancellation = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Recording(cancellation)));
 
-        let result = reserve_recording_command(&tx, &status, RecordingRequest::Stop).await;
+        let result = reserve_recording_command(&tx, &lifecycle, RecordingRequest::Stop).await;
 
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(*lock_app_status(&status), AppStatus::Recording);
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Recording);
         assert_eq!(
             rx.recv().await,
-            Some(ApiCommand::StartRecording(ApiCommandSource::Start))
+            Some(RecordingCommand::Start(ApiCommandSource::Start, queued))
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_from_recording_invalidates_utterance_and_enqueues_teardown() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Recording(cancellation.clone())));
+
+        let outcome = reserve_cancel_command(&tx, &lifecycle)
+            .await
+            .expect("cancel should enqueue");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.status, AppStatus::Idle);
+        assert_eq!(*lock_lifecycle(&lifecycle), AppLifecycle::Idle);
+        assert!(cancellation.is_cancelled());
+        match rx.recv().await {
+            Some(RecordingCommand::Cancel(queued)) => {
+                assert!(queued.same_session(&cancellation));
+            }
+            other => panic!("expected cancel command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_from_processing_invalidates_utterance_without_queueing_work() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(cancellation.clone())));
+
+        let outcome = reserve_cancel_command(&tx, &lifecycle)
+            .await
+            .expect("cancel should be accepted");
+
+        assert_eq!(outcome.status, AppStatus::Idle);
+        assert_eq!(*lock_lifecycle(&lifecycle), AppLifecycle::Idle);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn cancel_after_commit_reports_too_late() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        assert!(cancellation.try_commit());
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Processing(cancellation)));
+
+        let outcome = reserve_cancel_command(&tx, &lifecycle)
+            .await
+            .expect("late cancellation should return a response");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.message, "Text insertion has already started");
+        assert_eq!(outcome.status, AppStatus::Processing);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn failed_old_start_does_not_release_new_recording_reservation() {
+        let old = CancellationToken::new();
+        let replacement = CancellationToken::new();
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Recording(replacement.clone())));
+
+        release_recording_reservation(&lifecycle, &old);
+
+        assert!(matches!(
+            &*lock_lifecycle(&lifecycle),
+            AppLifecycle::Recording(current) if current.same_session(&replacement)
+        ));
+    }
+
+    #[tokio::test]
+    async fn processing_cancellation_allows_immediate_replacement_start() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
+
+        reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start)
+            .await
+            .unwrap();
+        let cancelled = lifecycle_token(&lock_lifecycle(&lifecycle))
+            .unwrap()
+            .clone();
+        reserve_recording_command(&tx, &lifecycle, RecordingRequest::Stop)
+            .await
+            .unwrap();
+        reserve_cancel_command(&tx, &lifecycle).await.unwrap();
+        reserve_recording_command(&tx, &lifecycle, RecordingRequest::Start)
+            .await
+            .unwrap();
+
+        let replacement = lifecycle_token(&lock_lifecycle(&lifecycle))
+            .unwrap()
+            .clone();
+        assert_eq!(lock_lifecycle(&lifecycle).status(), AppStatus::Recording);
+        assert!(cancelled.is_cancelled());
+        assert!(!replacement.is_cancelled());
+        assert!(!replacement.same_session(&cancelled));
+        assert!(
+            matches!(rx.recv().await, Some(RecordingCommand::Start(_, token)) if token.same_session(&cancelled))
+        );
+        assert!(
+            matches!(rx.recv().await, Some(RecordingCommand::Stop(_, token)) if token.same_session(&cancelled))
+        );
+        assert!(
+            matches!(rx.recv().await, Some(RecordingCommand::Start(_, token)) if token.same_session(&replacement))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_from_idle_is_an_idempotent_no_op() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lifecycle = Arc::new(Mutex::new(AppLifecycle::Idle));
+
+        let outcome = reserve_cancel_command(&tx, &lifecycle).await.unwrap();
+
+        assert!(outcome.success);
+        assert_eq!(outcome.status, AppStatus::Idle);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 }

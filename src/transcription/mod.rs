@@ -1,8 +1,8 @@
 use anyhow::Result;
-use std::path::PathBuf;
 use tracing::{debug, info};
 
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
 use crate::normalizer::Normalizer;
 use crate::whisper::provider::{AudioFileRetention, ModelStatusSnapshot};
 use crate::whisper::WhisperTranscriber;
@@ -24,30 +24,15 @@ impl TranscriptionService {
         })
     }
 
-    /// Transcribe audio file and return normalized text
-    #[allow(dead_code)] // main.rs compiles this module separately and uses the sample route.
-    pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
-        info!("Starting transcription pipeline for: {:?}", audio_path);
-        bench_trace::event_with_extra("transcription_begin", || {
-            serde_json::json!({
-                "audio_path": audio_path.display().to_string(),
-            })
-        });
-
-        // Step 1: Get raw transcription from whisper
-        debug!("Getting raw transcription from whisper");
-        let raw_transcription = self.whisper.transcribe(audio_path).await?;
-        Ok(self.normalize_transcription(raw_transcription))
-    }
-
     /// Transcribe mono, 16 kHz, 32-bit float samples and return normalized text.
     pub async fn transcribe_samples(
         &self,
         samples: &[f32],
         retention: AudioFileRetention,
+        cancellation: CancellationToken,
     ) -> Result<String> {
         info!(
-            "Starting transcription pipeline for {} in-memory samples",
+            "Starting cancellable transcription pipeline for {} in-memory samples",
             samples.len()
         );
         bench_trace::event_with_extra("transcription_begin", || {
@@ -57,8 +42,14 @@ impl TranscriptionService {
             })
         });
 
-        debug!("Getting raw transcription from whisper");
-        let raw_transcription = self.whisper.transcribe_samples(samples, retention).await?;
+        let raw_transcription = self
+            .whisper
+            .transcribe_samples(samples, retention, cancellation.clone())
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(anyhow::anyhow!("transcription cancelled"));
+        }
+
         Ok(self.normalize_transcription(raw_transcription))
     }
 
@@ -121,6 +112,7 @@ impl TranscriptionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
     use crate::whisper::provider::{AudioFileRetention, TranscriptionProvider};
     use std::future::Future;
     use std::path::Path;
@@ -141,6 +133,7 @@ mod tests {
             &'a self,
             _audio_path: &'a Path,
             _language: &'a str,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             panic!("sample pipeline must not call the path route")
         }
@@ -150,6 +143,7 @@ mod tests {
             _samples: &'a [f32],
             _language: &'a str,
             _retention: AudioFileRetention,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             Box::pin(async {
                 Ok("[00:00:00.000 --> 00:00:01.000] hello [BLANK_AUDIO] world".to_string())
@@ -163,10 +157,28 @@ mod tests {
         let service = TranscriptionService::new(whisper).unwrap();
 
         let text = service
-            .transcribe_samples(&[0.1, 0.2], AudioFileRetention::Delete)
+            .transcribe_samples(
+                &[0.1, 0.2],
+                AudioFileRetention::Delete,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
         assert_eq!(text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn cancelled_sample_pipeline_does_not_return_a_transcript() {
+        let whisper = WhisperTranscriber::from_provider(Box::new(RawSampleProvider), "en");
+        let service = TranscriptionService::new(whisper).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .transcribe_samples(&[0.1, 0.2], AudioFileRetention::Delete, cancellation)
+            .await;
+
+        assert!(result.is_err());
     }
 }

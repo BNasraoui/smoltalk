@@ -6,13 +6,13 @@ This document describes how smoltalk is put together: the modules, the data flow
 
 ## Overview
 
-smoltalk is a single-process Tokio daemon. An HTTP API receives start/stop/toggle commands (typically bound to Hyprland keybinds via `curl`), audio is captured from the microphone, transcribed by a pluggable Whisper provider, normalized, and injected into the focused window.
+smoltalk is a single-process Tokio daemon. An HTTP API receives start/stop/cancel/toggle commands (typically bound to Hyprland keybinds via `curl`), audio is captured from the microphone, transcribed by a pluggable Whisper provider, normalized, and injected into the focused window.
 
 ```
  Hyprland keybind ──curl──▶ HTTP API (axum, 127.0.0.1:3737)
-                                │  ApiCommand over mpsc
+                                │  RecordingCommand over mpsc
                                 ▼
-                         Main event loop (main.rs)
+                         Daemon event loop (app.rs)
                                 │
         ┌───────────┬───────────┼──────────────┬─────────────┐
         ▼           ▼           ▼              ▼             ▼
@@ -23,13 +23,15 @@ smoltalk is a single-process Tokio daemon. An HTTP API receives start/stop/toggl
                                             paste)
 ```
 
-Everything lives in one crate. `src/main.rs` wires the components together; `src/lib.rs` re-exports the modules for the `examples/`, `src/bin/test_api.rs`, and the test suite.
+Everything lives in one library crate. `src/app.rs` owns daemon construction and the event loop; `src/main.rs` is a thin argument-parsing entry point. `src/lib.rs` exports the modules used by the binary, examples, and tests, so each module is compiled once.
 
 ## Module map
 
 | Module | Responsibility |
 |--------|----------------|
+| `app` | `Daemon` ownership, component construction, command loop, and recording lifecycle orchestration |
 | `api` | axum HTTP server, request→command reservation, app status state machine, Waybar status responses |
+| `cancellation` | Per-utterance cancellation token and atomic cancel-versus-delivery commit gate |
 | `audio` | cpal input stream lifecycle, 16 kHz mono f32 sample buffer, VAD invocation on stop, and shared WAV encoding for file-based providers |
 | `vad` | Voice activity detection: Silero (via whisper-rs) with amplitude-gate fallback; trims silence and can skip transcription entirely |
 | `whisper` | `WhisperTranscriber` facade, `TranscriptionProvider` trait, provider selection/auto-detection |
@@ -47,32 +49,37 @@ Everything lives in one crate. `src/main.rs` wires the components together; `src
 
 ### Command ingestion and the status state machine
 
-The API server (`api/mod.rs`) and the main loop share a short-held `Arc<std::sync::Mutex<AppStatus>>` with three states: `Idle → Recording → Processing → Idle`. Status locks recover from poisoning and are never held across an `.await`. Handlers do not perform work; `reserve_recording_command` holds one synchronous critical section while it checks the current status, transitions it, and attempts to enqueue an `ApiCommand` on the bounded mpsc channel. If the enqueue fails, it rolls the transition back before releasing the lock. This gives:
+The API server (`api/mod.rs`) and `Daemon` share a short-held `Arc<std::sync::Mutex<AppLifecycle>>`. Its variants are `Idle`, `Recording(CancellationToken)`, and `Processing(CancellationToken)`, so an active state cannot exist without its utterance identity. Lifecycle locks recover from poisoning and are never held across an `.await`. Handlers do not perform work; command reservation holds one synchronous critical section while it transitions the lifecycle and attempts any required enqueue on the bounded mpsc channel. If enqueueing fails, it restores the previous variant before releasing the lock. This gives:
 
 - **Idempotent push-to-talk**: `/start` while recording and `/stop` while idle are accepted no-ops, so key-repeat and double-fires are harmless.
 - **Rollback on backpressure**: if the channel is full, the reservation rolls the status back and returns 503 instead of leaving the state machine wedged.
 - **Ordering**: a fast start→stop pair is queued in order even if the main loop hasn't consumed the start yet.
+- **Preemption**: `/cancel` invalidates the current token during recording or processing and exposes `Idle` immediately, allowing the next `/start` to queue while old work unwinds.
+- **Session ownership**: recovery guards compare token identity, so completion of an old cancelled utterance cannot reset the status of its replacement.
 
 `/toggle` maps to start-or-stop based on the current state; a toggle during `Processing` is refused (`success: false`) rather than queued.
 
-Endpoints: `POST /start`, `POST /stop`, `POST /toggle`, `GET /status` (plain or `?style=waybar`), `GET /model/status`, `POST /model/unload`, `POST /model/reload`.
+Endpoints: `POST /start`, `POST /stop`, `POST /cancel`, `POST /toggle`, `GET /status` (plain or `?style=waybar`), `GET /model/status`, `POST /model/unload`, `POST /model/reload`.
 
-### Recording lifecycle (main event loop)
+### Recording lifecycle (daemon event loop)
 
-`main.rs` runs a single sequential loop over `ApiCommand`s — only one recording/transcription cycle is in flight at a time.
+`app.rs` runs a single sequential loop over `RecordingCommand`s. A `Daemon` owns the audio recorder, transcription service, injector, indicator, configuration, lifecycle, and optional chunking session. Cancellation can reserve a replacement start immediately, but old audio/provider cleanup completes before that queued start physically opens the microphone.
 
-**StartRecording:**
+**Start:**
 1. Show the recording indicator (hyprctl notification + start sound).
 2. `AudioStreamManager::start_recording()` — clears the sample buffer and builds a cpal input stream (mono, 16 kHz — Whisper's native rate). The callback appends f32 samples into a shared `Arc<Mutex<Vec<f32>>>`.
 3. `TranscriptionService::prepare()` — begins loading the model **while the user is speaking**, hiding model-load latency inside the recording window.
 4. If `[chunking] enabled` and the provider supports it (whisper-rs only), spawn a `PauseChunkingSession` that watches the live buffer.
 
-**StopRecording:**
+**Stop:**
 1. Stop and drop the cpal stream; move the samples out of the shared buffer (`std::mem::take`, no copy). When chunking is active, also retain a snapshot for the session's final segment.
 2. Run VAD. If no speech was detected, skip provider dispatch, temporary-file creation, and transcription entirely and report "No speech detected".
-3. Otherwise pass the VAD-trimmed 16 kHz mono f32 samples to `TranscriptionService::transcribe_samples` — either directly or as a full fallback if finishing the chunking session fails. The raw final chunking snapshot remains separate from the trimmed fallback samples.
-4. If `auto_paste` is on, inject the text; show completion or error via the indicator.
-5. The per-command recovery envelope attempts `recording_complete()` on the provider (which may release the model — see below), then releases the `Processing` reservation. A scope guard restores status to `Idle` after successful work, a returned error, cancellation, or a caught unwind. Provider lifecycle errors and panics are contained, so they cannot prevent the guard from running; whenever the envelope completes, lifecycle completion is attempted before `Idle` becomes visible.
+3. Otherwise pass the VAD-trimmed 16 kHz mono f32 samples to the cancellable transcription path — either directly or as a full fallback if finishing the chunking session fails. The raw final chunking snapshot remains separate from the trimmed fallback samples.
+4. Atomically claim the token's delivery gate. Cancellation that wins this race suppresses the result; once delivery wins, `/cancel` reports that insertion has already started rather than attempting an unsafe undo.
+5. If `auto_paste` is on, inject the text; show completion or error via the indicator.
+6. The per-command recovery envelope attempts `recording_complete()` on the provider (which may release the model — see below), then releases the `Processing` reservation only if it still owns the current token. Provider lifecycle errors and panics are contained.
+
+**Cancel:** while recording, stop the cpal stream, clear samples, cancel chunk work, and skip VAD. While processing, the API token directly interrupts work without waiting behind the command queue. whisper-rs uses whisper.cpp's abort callback, API requests are dropped, and CLI child processes are killed on cancellation. Every path checks the token before delivery, so cancelled text is never injected.
 
 `transcribe_samples` accepts mono, 16 kHz f32 samples. whisper-rs consumes that slice directly. File-based providers inherit a collision-safe temporary-WAV adapter; its retention guard owns cleanup through provider completion.
 
@@ -82,16 +89,16 @@ Three layers, top down:
 
 1. **`TranscriptionService`** (`transcription/mod.rs`) — the object the rest of the app holds. Wraps a `WhisperTranscriber` plus a `Normalizer` chosen to match the provider's output format (e.g. whisper.cpp emits `[00:00:00.000 --> ...]` timestamps that must be stripped; OpenAI CLI output needs different cleanup). All model-lifecycle calls (`prepare`, `unload_model`, `reload_model`, `model_status`, `recording_complete`) pass through it.
 2. **`WhisperTranscriber`** (`whisper/mod.rs`) — resolves the `[whisper] provider` config value to a concrete provider, or auto-detects one (OpenAI CLI, then whisper.cpp CLI) when unset. Translates the flat `ProviderConfig` into provider-specific option structs.
-3. **`TranscriptionProvider`** (`whisper/provider.rs`) — the trait each backend implements. `transcribe(path, language)`, `name`, and `is_available` are required. `transcribe_samples` has an object-safe default that writes a unique `chezwizper-*.wav`, delegates to the path method, and either deletes or retains the file according to `AudioFileRetention`. Lifecycle hooks (`prepare`, `unload_model`, `recording_complete`, `model_status`, `supports_chunking`) have no-op defaults, so subprocess/API providers stay trivial.
+3. **`TranscriptionProvider`** (`whisper/provider.rs`) — the trait each backend implements. The single `transcribe`/`transcribe_samples` path always receives the utterance cancellation token. The object-safe sample default writes a unique `chezwizper-*.wav`, delegates to the path method, and either deletes or retains the file according to `AudioFileRetention`. Blocking providers make that path preemptible by aborting inference, dropping requests, or terminating child processes. Lifecycle hooks (`prepare`, `unload_model`, `recording_complete`, `model_status`, `supports_chunking`) have no-op defaults.
 
 ### Providers
 
 | Provider | Mechanism | Notes |
 |----------|-----------|-------|
-| `whisper-rs` | In-process via whisper.cpp bindings | Consumes f32 samples directly; supports warm model retention, in-memory chunking, and `audio_ctx` tuning |
-| `whisper-cpp` | Spawns `whisper-cli` | Uses the default sample-to-WAV adapter; model reloaded from disk each utterance |
-| `openai-cli` | Spawns the `whisper` Python CLI | Uses the default sample-to-WAV adapter |
-| `openai-api` | HTTPS to OpenAI's transcription API | Uses the default sample-to-WAV adapter; requires `api_key`; never auto-detected |
+| `whisper-rs` | In-process via whisper.cpp bindings | Consumes f32 samples directly; abort callback supports preemption; supports warm retention, chunking, and `audio_ctx` tuning |
+| `whisper-cpp` | Spawns `whisper-cli` | Uses the sample-to-WAV adapter; cancellation kills the child process; model reloaded each utterance |
+| `openai-cli` | Spawns the `whisper` Python CLI | Uses the sample-to-WAV adapter; cancellation kills the child process |
+| `openai-api` | HTTPS to OpenAI's transcription API | Uses the sample-to-WAV adapter; cancellation drops the request; requires `api_key`; never auto-detected |
 
 See [Adding Providers](./adding-providers.md) for the extension guide.
 
@@ -143,9 +150,9 @@ One TOML file (`~/.config/chezwizper/config.toml`, overridable with `--config`) 
 
 ## Threading model
 
-- The **main loop** is a single async task; recording cycles never overlap.
-- Each **StopRecording command** has its own unwind boundary. Rust panics from stop work or provider lifecycle completion are logged and contained so the command consumer remains alive for the next request.
+- The **daemon loop** is a single async task; cancellation can reserve new work immediately, while command ordering prevents audio cleanup from overlapping the replacement recording.
+- Each **Stop command** has its own unwind boundary. Rust panics from stop work or provider lifecycle completion are logged and contained so the command consumer remains alive for the next request.
 - **cpal** delivers audio on its own realtime callback thread, writing into the shared sample buffer.
-- The **API server** runs as a spawned Tokio task; handlers only hold the synchronous status mutex for enum transitions and nonblocking command reservation.
+- The **API server** runs as a spawned Tokio task; handlers only hold the synchronous lifecycle mutex for enum transitions and nonblocking command reservation.
 - **Chunk transcriptions** run on `spawn_blocking` threads (whisper inference is CPU-bound and synchronous); the chunking watcher itself is an async task.
 - Whisper-rs inference is serialized behind the provider's internal mutex, so concurrent chunk transcriptions queue rather than contend for the model.

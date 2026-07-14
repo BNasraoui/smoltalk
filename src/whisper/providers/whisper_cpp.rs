@@ -2,12 +2,14 @@ use anyhow::{Context, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use std::process::{Output, Stdio};
+use std::time::Duration;
+use tracing::info;
 use which::which;
 
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
+use crate::whisper::process::{run_command, ProcessError};
 use crate::whisper::provider::TranscriptionProvider;
 
 pub struct WhisperCppProvider {
@@ -62,28 +64,26 @@ impl WhisperCppProvider {
     }
 }
 
-fn add_performance_args(cmd: &mut Command, options: &WhisperCppOptions) {
+fn add_async_performance_args(cmd: &mut tokio::process::Command, options: &WhisperCppOptions) {
     if let Some(threads) = options.threads {
         cmd.arg("-t").arg(threads.to_string());
     }
-
     if let Some(beam_size) = options.beam_size {
         cmd.arg("-bs").arg(beam_size.to_string());
     }
-
     if let Some(best_of) = options.best_of {
         cmd.arg("-bo").arg(best_of.to_string());
     }
-
     if options.no_fallback.unwrap_or(false) {
         cmd.arg("-nf");
     }
 }
 
-fn run_command(
-    mut cmd: Command,
+async fn run_command_cancellable(
+    cmd: tokio::process::Command,
     timeout_secs: Option<u64>,
     context: &'static str,
+    cancellation: CancellationToken,
 ) -> Result<Output> {
     bench_trace::event_with_extra("provider_command_spawn", || {
         serde_json::json!({
@@ -92,64 +92,31 @@ fn run_command(
             "context": context,
         })
     });
-
-    let Some(timeout_secs) = timeout_secs else {
-        let output = cmd.output().context(context)?;
-        bench_trace::event_with_extra("provider_command_exit", || {
-            serde_json::json!({
-                "provider": "whisper.cpp",
-                "status": output.status.code(),
-                "success": output.status.success(),
-                "context": context,
-            })
-        });
-        return Ok(output);
-    };
-
-    let mut child = cmd.spawn().context(context)?;
-    let child_pid = child.id();
-    let started_at = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
-
-    loop {
-        if child
-            .try_wait()
-            .context("Failed to poll whisper.cpp command")?
-            .is_some()
-        {
-            let output = child.wait_with_output().context(context)?;
-            bench_trace::event_with_extra("provider_command_exit", || {
-                serde_json::json!({
-                    "provider": "whisper.cpp",
-                    "child_pid": child_pid,
-                    "status": output.status.code(),
-                    "success": output.status.success(),
-                    "context": context,
-                })
-            });
-            return Ok(output);
+    let output = run_command(
+        cmd,
+        timeout_secs.map(Duration::from_secs),
+        context,
+        cancellation,
+    )
+    .await
+    .map_err(|error| match error {
+        ProcessError::TimedOut => {
+            anyhow::anyhow!(
+                "whisper.cpp command timed out after {}s",
+                timeout_secs.unwrap_or_default()
+            )
         }
-
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bench_trace::event_with_extra("provider_command_exit", || {
-                serde_json::json!({
-                    "provider": "whisper.cpp",
-                    "child_pid": child_pid,
-                    "success": false,
-                    "timed_out": true,
-                    "timeout_secs": timeout_secs,
-                    "context": context,
-                })
-            });
-            return Err(anyhow::anyhow!(
-                "whisper.cpp command timed out after {timeout_secs}s"
-            ));
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        error => anyhow::Error::new(error),
+    })?;
+    bench_trace::event_with_extra("provider_command_exit", || {
+        serde_json::json!({
+            "provider": "whisper.cpp",
+            "status": output.status.code(),
+            "success": output.status.success(),
+            "context": context,
+        })
+    });
+    Ok(output)
 }
 
 impl TranscriptionProvider for WhisperCppProvider {
@@ -165,6 +132,7 @@ impl TranscriptionProvider for WhisperCppProvider {
         &'a self,
         audio_path: &'a Path,
         language: &'a str,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         let audio_path = audio_path.to_path_buf();
         let language = language.to_string();
@@ -174,17 +142,10 @@ impl TranscriptionProvider for WhisperCppProvider {
         let options = self.options.clone();
 
         Box::pin(async move {
-            info!("Using whisper.cpp to transcribe: {:?}", audio_path);
-            warn!("whisper.cpp integration is experimental - consider using OpenAI whisper");
-
-            let model_arg = if let Some(mp) = &model_path {
-                info!("Using custom model path: {}", mp);
-                mp.clone()
-            } else {
-                format!("models/ggml-{model}.bin")
-            };
-
-            let mut cmd = Command::new(&command_path);
+            let model_arg = model_path
+                .clone()
+                .unwrap_or_else(|| format!("models/ggml-{model}.bin"));
+            let mut cmd = tokio::process::Command::new(&command_path);
             cmd.arg("-f")
                 .arg(&audio_path)
                 .arg("-m")
@@ -196,50 +157,41 @@ impl TranscriptionProvider for WhisperCppProvider {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .stdin(Stdio::null());
-            add_performance_args(&mut cmd, &options);
+            add_async_performance_args(&mut cmd, &options);
 
-            let output = run_command(
+            let output = run_command_cancellable(
                 cmd,
                 options.timeout_secs,
                 "Failed to execute whisper.cpp command",
-            )?;
+                cancellation.clone(),
+            )
+            .await?;
 
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                error!("Whisper.cpp failed: {}", stderr);
-
-                warn!("Trying fallback whisper.cpp command");
-                let mut cmd = Command::new(&command_path);
+                let mut cmd = tokio::process::Command::new(&command_path);
                 cmd.arg("-f").arg(&audio_path);
-
-                if let Some(mp) = &model_path {
-                    cmd.arg("-m").arg(mp);
+                if let Some(model_path) = &model_path {
+                    cmd.arg("-m").arg(model_path);
                 }
-                add_performance_args(&mut cmd, &options);
+                add_async_performance_args(&mut cmd, &options);
                 cmd.stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null());
 
-                let output = run_command(
+                let output = run_command_cancellable(
                     cmd,
                     options.timeout_secs,
                     "Failed to execute fallback whisper.cpp command",
-                )?;
-
+                    cancellation,
+                )
+                .await?;
                 if !output.status.success() {
                     return Err(anyhow::anyhow!("Whisper.cpp transcription failed"));
                 }
-
-                let transcription = String::from_utf8_lossy(&output.stdout);
-                return Ok(transcription.trim().to_string());
+                return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
             }
 
-            let transcription = String::from_utf8_lossy(&output.stdout);
-            let transcription = transcription.trim().to_string();
-
-            info!("Transcription complete: {} chars", transcription.len());
-
-            Ok(transcription)
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         })
     }
 }
@@ -247,9 +199,10 @@ impl TranscriptionProvider for WhisperCppProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -303,7 +256,10 @@ mod tests {
         )
         .unwrap();
 
-        let result = provider.transcribe(&audio_path, "en").await.unwrap();
+        let result = provider
+            .transcribe(&audio_path, "en", CancellationToken::new())
+            .await
+            .unwrap();
 
         assert_eq!(result, "transcript");
         assert_eq!(
@@ -361,7 +317,10 @@ mod tests {
         )
         .unwrap();
 
-        let result = provider.transcribe(&audio_path, "en").await.unwrap();
+        let result = provider
+            .transcribe(&audio_path, "en", CancellationToken::new())
+            .await
+            .unwrap();
 
         assert_eq!(result, "fallback transcript");
         assert_eq!(
@@ -401,8 +360,38 @@ mod tests {
         )
         .unwrap();
 
-        let err = provider.transcribe(&audio_path, "en").await.unwrap_err();
+        let err = provider
+            .transcribe(&audio_path, "en", CancellationToken::new())
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_terminates_whisper_cpp_promptly() {
+        let command_path = unique_test_path("whisper-cancel");
+        let audio_path = unique_test_path("audio.wav");
+        fs::write(&audio_path, "audio").unwrap();
+        write_executable_script(&command_path, "#!/bin/sh\nexec sleep 1\n");
+        let provider = WhisperCppProvider::new(
+            Some(command_path.to_string_lossy().to_string()),
+            "base".to_string(),
+            None,
+            WhisperCppOptions::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+        let started = Instant::now();
+
+        let result = provider.transcribe(&audio_path, "en", cancellation).await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

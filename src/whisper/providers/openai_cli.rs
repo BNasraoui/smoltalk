@@ -3,10 +3,12 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use tracing::{error, info};
+use tracing::info;
 use which::which;
 
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
+use crate::whisper::process::run_command;
 use crate::whisper::provider::TranscriptionProvider;
 
 pub struct OpenAIWhisperCliProvider {
@@ -69,6 +71,7 @@ impl TranscriptionProvider for OpenAIWhisperCliProvider {
         &'a self,
         audio_path: &'a Path,
         language: &'a str,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         let audio_path = audio_path.to_path_buf();
         let language = language.to_string();
@@ -76,9 +79,13 @@ impl TranscriptionProvider for OpenAIWhisperCliProvider {
         let model = self.model.clone();
 
         Box::pin(async move {
-            info!("Using OpenAI Whisper CLI to transcribe: {:?}", audio_path);
-
-            let mut command = Command::new(&command_path);
+            let audio_stem = audio_path
+                .file_stem()
+                .context("Invalid audio path")?
+                .to_str()
+                .context("Invalid audio filename")?;
+            let output_path = PathBuf::from(format!("/tmp/{audio_stem}.txt"));
+            let mut command = tokio::process::Command::new(&command_path);
             command
                 .arg(&audio_path)
                 .arg("--model")
@@ -99,9 +106,20 @@ impl TranscriptionProvider for OpenAIWhisperCliProvider {
                 })
             });
 
-            let output = command
-                .output()
-                .context("Failed to execute whisper command")?;
+            let output = match run_command(
+                command,
+                None,
+                "Failed to execute whisper command",
+                cancellation,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&output_path).await;
+                    return Err(error.into());
+                }
+            };
             bench_trace::event_with_extra("provider_command_exit", || {
                 serde_json::json!({
                     "provider": "OpenAI Whisper CLI",
@@ -112,26 +130,52 @@ impl TranscriptionProvider for OpenAIWhisperCliProvider {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                error!("Whisper failed: {}", stderr);
+                let _ = tokio::fs::remove_file(&output_path).await;
                 return Err(anyhow::anyhow!("Whisper transcription failed: {}", stderr));
             }
 
-            let audio_stem = audio_path
-                .file_stem()
-                .context("Invalid audio path")?
-                .to_str()
-                .context("Invalid audio filename")?;
+            let transcription = tokio::fs::read_to_string(&output_path)
+                .await
+                .context("Failed to read transcription output");
+            let _ = tokio::fs::remove_file(&output_path).await;
 
-            let output_path = PathBuf::from(format!("/tmp/{audio_stem}.txt"));
-            let transcription = std::fs::read_to_string(&output_path)
-                .context("Failed to read transcription output")?;
-
-            let _ = std::fs::remove_file(&output_path);
-
-            let transcription = transcription.trim().to_string();
-            info!("Transcription complete: {} chars", transcription.len());
-
-            Ok(transcription)
+            Ok(transcription?.trim().to_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancellation::CancellationToken;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_terminates_the_cli_process_promptly() {
+        let directory = tempfile::tempdir().unwrap();
+        let command_path = directory.path().join("slow-whisper");
+        std::fs::write(&command_path, "#!/bin/sh\nexec sleep 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&command_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&command_path, permissions).unwrap();
+        let provider = OpenAIWhisperCliProvider {
+            command_path,
+            model: "base.en".to_string(),
+        };
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+        let started = Instant::now();
+
+        let result = provider
+            .transcribe(Path::new("unused.wav"), "en", cancellation)
+            .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

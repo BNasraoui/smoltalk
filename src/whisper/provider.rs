@@ -5,6 +5,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use crate::audio::write_samples_to_wav;
+use crate::cancellation::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioFileRetention {
@@ -64,8 +65,13 @@ pub trait TranscriptionProvider: Send + Sync {
         samples: &'a [f32],
         language: &'a str,
         retention: AudioFileRetention,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("transcription cancelled"));
+            }
+
             let temp_path = tempfile::Builder::new()
                 .prefix("chezwizper-")
                 .suffix(".wav")
@@ -75,13 +81,14 @@ pub trait TranscriptionProvider: Send + Sync {
             match retention {
                 AudioFileRetention::Delete => {
                     write_samples_to_wav(temp_path.as_ref(), samples)?;
-                    self.transcribe(temp_path.as_ref(), language).await
+                    self.transcribe(temp_path.as_ref(), language, cancellation)
+                        .await
                 }
                 AudioFileRetention::Keep => {
                     let path = temp_path.keep()?;
                     write_samples_to_wav(&path, samples)?;
                     tracing::info!("Audio recording retained at: {:?}", path);
-                    self.transcribe(&path, language).await
+                    self.transcribe(&path, language, cancellation).await
                 }
             }
         })
@@ -91,12 +98,14 @@ pub trait TranscriptionProvider: Send + Sync {
         &'a self,
         audio_path: &'a Path,
         language: &'a str,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -114,6 +123,30 @@ mod tests {
     struct InspectingProvider {
         observations: Mutex<Vec<ObservedWav>>,
         fail: bool,
+    }
+
+    struct PendingProvider;
+
+    impl TranscriptionProvider for PendingProvider {
+        fn name(&self) -> &'static str {
+            "pending-provider"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn transcribe<'a>(
+            &'a self,
+            _audio_path: &'a Path,
+            _language: &'a str,
+            cancellation: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                Err(anyhow::anyhow!("transcription cancelled"))
+            })
+        }
     }
 
     impl InspectingProvider {
@@ -154,6 +187,7 @@ mod tests {
             &'a self,
             audio_path: &'a Path,
             language: &'a str,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             Box::pin(async move {
                 let mut reader = hound::WavReader::open(audio_path)?;
@@ -185,7 +219,12 @@ mod tests {
         let samples = [0.25, -0.5, 0.75];
 
         let transcript = provider
-            .transcribe_samples(&samples, "fr", AudioFileRetention::Delete)
+            .transcribe_samples(
+                &samples,
+                "fr",
+                AudioFileRetention::Delete,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -202,12 +241,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellable_sample_adapter_drops_pending_provider_work() {
+        let provider = PendingProvider;
+        let cancellation = CancellationToken::new();
+        let work = provider.transcribe_samples(
+            &[0.1],
+            "en",
+            AudioFileRetention::Delete,
+            cancellation.clone(),
+        );
+        tokio::pin!(work);
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), work)
+            .await
+            .expect("cancelled provider work should finish");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellable_path_adapter_drops_pending_provider_work() {
+        let provider = PendingProvider;
+        let cancellation = CancellationToken::new();
+        let work = provider.transcribe(Path::new("unused.wav"), "en", cancellation.clone());
+        tokio::pin!(work);
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), work)
+            .await
+            .expect("cancelled provider work should finish");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn sample_adapter_uses_distinct_paths_for_concurrent_calls() {
         let provider = InspectingProvider::succeeding();
 
         let (first, second) = tokio::join!(
-            provider.transcribe_samples(&[0.1], "en", AudioFileRetention::Delete),
-            provider.transcribe_samples(&[0.2], "en", AudioFileRetention::Delete),
+            provider.transcribe_samples(
+                &[0.1],
+                "en",
+                AudioFileRetention::Delete,
+                CancellationToken::new(),
+            ),
+            provider.transcribe_samples(
+                &[0.2],
+                "en",
+                AudioFileRetention::Delete,
+                CancellationToken::new(),
+            ),
         );
 
         first.unwrap();
@@ -222,7 +308,12 @@ mod tests {
         let provider = InspectingProvider::succeeding();
 
         provider
-            .transcribe_samples(&[0.1], "en", AudioFileRetention::Delete)
+            .transcribe_samples(
+                &[0.1],
+                "en",
+                AudioFileRetention::Delete,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -235,7 +326,12 @@ mod tests {
         let provider = InspectingProvider::failing();
 
         let result = provider
-            .transcribe_samples(&[0.1], "en", AudioFileRetention::Delete)
+            .transcribe_samples(
+                &[0.1],
+                "en",
+                AudioFileRetention::Delete,
+                CancellationToken::new(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -248,7 +344,12 @@ mod tests {
         let provider = InspectingProvider::succeeding();
 
         provider
-            .transcribe_samples(&[0.1], "en", AudioFileRetention::Keep)
+            .transcribe_samples(
+                &[0.1],
+                "en",
+                AudioFileRetention::Keep,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -262,7 +363,12 @@ mod tests {
         let provider = InspectingProvider::failing();
 
         let result = provider
-            .transcribe_samples(&[0.1], "en", AudioFileRetention::Keep)
+            .transcribe_samples(
+                &[0.1],
+                "en",
+                AudioFileRetention::Keep,
+                CancellationToken::new(),
+            )
             .await;
 
         assert!(result.is_err());

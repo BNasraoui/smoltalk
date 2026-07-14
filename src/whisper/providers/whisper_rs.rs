@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
 use crate::whisper::provider::{AudioFileRetention, ModelStatusSnapshot, TranscriptionProvider};
 use crate::whisper::AudioCtxConfig;
 
@@ -267,18 +268,25 @@ impl WhisperRsProvider {
         }
     }
 
-    fn transcribe_loaded_samples(&self, samples: &[f32], language: &str) -> Result<String> {
+    fn transcribe_loaded_samples(
+        &self,
+        samples: &[f32],
+        language: &str,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<String> {
         let mut inner = self.inner.lock().unwrap();
         let text = {
-            let params = self.full_params(language, samples.len());
+            let cancellation = cancellation.map(Box::new);
+            let params = self.full_params(language, samples.len(), cancellation.as_deref());
             let state = inner
                 .whisper_state
                 .as_mut()
                 .context("whisper-rs state is not available")?;
 
-            state
-                .full(params, samples)
-                .context("whisper-rs transcription failed")?;
+            let result = state.full(params, samples);
+            // The C callback borrows this stable allocation for the duration of `full`.
+            drop(cancellation);
+            result.context("whisper-rs transcription failed")?;
 
             let mut text = String::new();
             for segment in state.as_iter() {
@@ -293,7 +301,12 @@ impl WhisperRsProvider {
         Ok(text.trim().to_string())
     }
 
-    fn full_params<'a>(&'a self, language: &'a str, sample_count: usize) -> FullParams<'a, 'a> {
+    fn full_params<'a>(
+        &'a self,
+        language: &'a str,
+        sample_count: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> FullParams<'a, 'a> {
         let strategy = if let Some(beam_size) = self.options.beam_size {
             SamplingStrategy::BeamSearch {
                 beam_size: beam_size.max(1) as i32,
@@ -314,6 +327,16 @@ impl WhisperRsProvider {
         params.set_print_timestamps(false);
         params.set_print_special(false);
         params.set_no_context(true);
+
+        if let Some(cancellation) = cancellation {
+            let user_data = std::ptr::from_ref(cancellation)
+                .cast_mut()
+                .cast::<std::ffi::c_void>();
+            unsafe {
+                params.set_abort_callback(Some(cancellation_abort_callback));
+                params.set_abort_callback_user_data(user_data);
+            }
+        }
 
         if let Some(threads) = self.options.threads {
             params.set_n_threads(threads.max(1) as i32);
@@ -338,6 +361,15 @@ impl WhisperRsProvider {
     }
 }
 
+unsafe extern "C" fn cancellation_abort_callback(user_data: *mut std::ffi::c_void) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+
+    let cancellation = &*user_data.cast::<CancellationToken>();
+    cancellation.is_cancelled()
+}
+
 impl TranscriptionProvider for WhisperRsProvider {
     fn name(&self) -> &'static str {
         "whisper-rs"
@@ -356,8 +388,22 @@ impl TranscriptionProvider for WhisperRsProvider {
     }
 
     fn model_status(&self) -> Option<ModelStatusSnapshot> {
-        self.unload_if_idle_expired();
-        let inner = self.inner.lock().unwrap();
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Some(ModelStatusSnapshot {
+                    provider: self.name(),
+                    state: "busy",
+                    error: None,
+                });
+            }
+        };
+        if inner.context.is_some() && inner.state.should_idle_unload(Instant::now()) {
+            inner.whisper_state = None;
+            inner.context = None;
+            inner.state.mark_unloaded(UnloadReason::IdleTimer);
+        }
 
         Some(ModelStatusSnapshot {
             provider: self.name(),
@@ -392,11 +438,15 @@ impl TranscriptionProvider for WhisperRsProvider {
         &'a self,
         audio_path: &'a Path,
         language: &'a str,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("transcription cancelled"));
+            }
             self.ensure_loaded()?;
             let samples = read_wav_samples(audio_path)?;
-            self.transcribe_loaded_samples(&samples, language)
+            self.transcribe_loaded_samples(&samples, language, Some(cancellation))
         })
     }
 
@@ -405,10 +455,14 @@ impl TranscriptionProvider for WhisperRsProvider {
         samples: &'a [f32],
         language: &'a str,
         _retention: AudioFileRetention,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("transcription cancelled"));
+            }
             self.ensure_loaded()?;
-            self.transcribe_loaded_samples(samples, language)
+            self.transcribe_loaded_samples(samples, language, Some(cancellation))
         })
     }
 }
@@ -498,8 +552,10 @@ fn trace_state_transition(status: WhisperRsModelStatus, reason: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancellation::CancellationToken;
     use crate::whisper::provider::AudioFileRetention;
     use std::collections::HashSet;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     fn temporary_chezwizper_wavs() -> HashSet<PathBuf> {
@@ -664,6 +720,43 @@ mod tests {
     }
 
     #[test]
+    fn model_status_does_not_wait_for_active_inference() {
+        let provider = Arc::new(
+            WhisperRsProvider::new(
+                "base.en".to_string(),
+                Some("/tmp/missing-whisper-model.bin".to_string()),
+                WhisperRsOptions::default(),
+            )
+            .unwrap(),
+        );
+        let inference_lock = provider.inner.lock().unwrap();
+        let status_provider = provider.clone();
+        let (status_tx, status_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            status_tx.send(status_provider.model_status()).unwrap();
+        });
+
+        let status = status_rx.recv_timeout(Duration::from_millis(100));
+        drop(inference_lock);
+        worker.join().unwrap();
+
+        let status = status.expect("model status should not block behind inference");
+        assert_eq!(status.unwrap().state, "busy");
+    }
+
+    #[test]
+    fn whisper_abort_callback_observes_utterance_cancellation() {
+        let cancellation = Box::new(CancellationToken::new());
+        let user_data = std::ptr::from_ref(cancellation.as_ref())
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+
+        assert!(!unsafe { cancellation_abort_callback(user_data) });
+        cancellation.cancel();
+        assert!(unsafe { cancellation_abort_callback(user_data) });
+    }
+
+    #[test]
     fn path_input_reads_f32_wav_samples() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("float.wav");
@@ -720,7 +813,12 @@ mod tests {
         let before = temporary_chezwizper_wavs();
 
         let result = provider
-            .transcribe_samples(&[0.123_456, -0.654_321], "en", AudioFileRetention::Keep)
+            .transcribe_samples(
+                &[0.123_456, -0.654_321],
+                "en",
+                AudioFileRetention::Keep,
+                CancellationToken::new(),
+            )
             .await;
 
         let created = temporary_chezwizper_wavs()
@@ -756,7 +854,12 @@ mod tests {
         let before = temporary_chezwizper_wavs();
 
         let text = provider
-            .transcribe_samples(&samples, "en", AudioFileRetention::Keep)
+            .transcribe_samples(
+                &samples,
+                "en",
+                AudioFileRetention::Keep,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 

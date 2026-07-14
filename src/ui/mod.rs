@@ -121,6 +121,17 @@ impl Indicator {
         Ok(())
     }
 
+    pub async fn show_cancelled(&self) -> Result<()> {
+        info!("Showing cancellation indicator");
+
+        if let Err(e) = self.hyprland_notify("󰜺 Recording cancelled") {
+            debug!("Hyprland notification failed: {}", e);
+        }
+
+        self.play_sound("cancel").await;
+        Ok(())
+    }
+
     pub async fn show_error(&self, error: &str) -> Result<()> {
         warn!("Showing error: {}", error);
 
@@ -164,6 +175,7 @@ impl Indicator {
             "start" => (800, 150),     // High pitch, short beep
             "stop" => (400, 200),      // Low pitch, longer beep
             "complete" => (1000, 100), // Very high pitch, very short beep
+            "cancel" => (250, 120),    // Low, short cancellation cue
             _ => (500, 150),
         };
 

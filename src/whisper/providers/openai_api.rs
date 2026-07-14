@@ -7,6 +7,7 @@ use std::pin::Pin;
 use tracing::{debug, error, info};
 
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
 use crate::whisper::provider::TranscriptionProvider;
 
 #[derive(Debug, Deserialize)]
@@ -63,8 +64,12 @@ impl TranscriptionProvider for OpenAIProvider {
         &'a self,
         audio_path: &'a Path,
         language: &'a str,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("transcription cancelled"));
+            }
             info!("Transcribing audio file via OpenAI API: {:?}", audio_path);
 
             let audio_data = tokio::fs::read(audio_path)
@@ -107,20 +112,32 @@ impl TranscriptionProvider for OpenAIProvider {
                 })
             });
 
-            let response = self
+            let request = self
                 .client
                 .post(&self.endpoint)
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .multipart(form)
-                .send()
-                .await
-                .context("Failed to send request to OpenAI API")?;
+                .send();
+            let response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow::anyhow!("transcription cancelled"));
+                }
+                response = request => {
+                    response.context("Failed to send request to OpenAI API")?
+                }
+            };
 
             let status = response.status();
-            let response_text = response
-                .text()
-                .await
-                .context("Failed to read response body")?;
+            let response_text = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow::anyhow!("transcription cancelled"));
+                }
+                response_text = response.text() => {
+                    response_text.context("Failed to read response body")?
+                }
+            };
             bench_trace::event_with_extra("provider_api_request_end", || {
                 serde_json::json!({
                     "provider": "OpenAI API",

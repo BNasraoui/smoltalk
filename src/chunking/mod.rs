@@ -1,5 +1,6 @@
 use crate::audio::{FinalRecordingSnapshot, RecordingBuffer};
 use crate::bench_trace;
+use crate::cancellation::CancellationToken;
 use crate::config::ChunkingConfig;
 use crate::transcription::TranscriptionService;
 use crate::vad::VadSettings;
@@ -227,6 +228,7 @@ enum SessionCommand {
 pub struct PauseChunkingSession {
     command_tx: Option<oneshot::Sender<SessionCommand>>,
     task: tokio::task::JoinHandle<Result<Option<String>>>,
+    cancellation: CancellationToken,
 }
 
 impl PauseChunkingSession {
@@ -236,6 +238,7 @@ impl PauseChunkingSession {
         sample_rate: u32,
         buffer: RecordingBuffer,
         transcription_service: Arc<TranscriptionService>,
+        cancellation: CancellationToken,
     ) -> Self {
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let segmenter = PauseSegmenter::new(PauseSegmenterSettings {
@@ -247,6 +250,7 @@ impl PauseChunkingSession {
             overlap_ms: config.overlap_ms.min(config.pause_ms),
         });
         let (command_tx, command_rx) = oneshot::channel();
+        let chunk_cancellation = cancellation.clone();
         let task = tokio::spawn(run_session(
             segmenter,
             buffer,
@@ -258,6 +262,7 @@ impl PauseChunkingSession {
                     samples,
                     session_id,
                     chunk_index,
+                    chunk_cancellation.clone(),
                 )
             },
         ));
@@ -266,6 +271,7 @@ impl PauseChunkingSession {
         Self {
             command_tx: Some(command_tx),
             task,
+            cancellation,
         }
     }
 
@@ -285,10 +291,10 @@ impl PauseChunkingSession {
     }
 
     pub async fn cancel(mut self) {
+        self.cancellation.cancel();
         if let Some(command_tx) = self.command_tx.take() {
             let _ = command_tx.send(SessionCommand::Cancel);
         }
-        self.task.abort();
         let _ = self.task.await;
     }
 }
@@ -298,6 +304,7 @@ async fn transcribe_chunk(
     samples: Vec<f32>,
     session_id: u64,
     chunk_index: usize,
+    cancellation: CancellationToken,
 ) -> Result<String> {
     let runtime = tokio::runtime::Handle::current();
     bench_trace::event_with_extra("chunk_transcription_begin", || {
@@ -309,9 +316,11 @@ async fn transcribe_chunk(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        runtime.block_on(
-            transcription_service.transcribe_samples(&samples, AudioFileRetention::Delete),
-        )
+        runtime.block_on(transcription_service.transcribe_samples(
+            &samples,
+            AudioFileRetention::Delete,
+            cancellation,
+        ))
     })
     .await
     .context("pause chunk transcription worker panicked")?;
@@ -425,6 +434,7 @@ where
 mod tests {
     use super::*;
     use crate::audio::RecordingBuffer;
+    use crate::cancellation::CancellationToken;
     use crate::whisper::provider::{AudioFileRetention, TranscriptionProvider};
     use crate::whisper::WhisperTranscriber;
     use std::path::Path;
@@ -458,6 +468,7 @@ mod tests {
             &'a self,
             _audio_path: &'a Path,
             _language: &'a str,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             panic!("chunk transcription must not use the path route")
         }
@@ -467,6 +478,7 @@ mod tests {
             samples: &'a [f32],
             _language: &'a str,
             retention: AudioFileRetention,
+            _cancellation: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             Box::pin(async move {
                 *self.observed.lock().unwrap() = Some(ObservedChunkSamples {
@@ -645,8 +657,16 @@ mod tests {
         let samples = vec![0.125, -0.25, 0.5];
         let session_id = u64::MAX;
         let chunk_index = usize::MAX;
+        let cancellation = CancellationToken::new();
 
-        let result = transcribe_chunk(service, samples.clone(), session_id, chunk_index).await;
+        let result = transcribe_chunk(
+            service,
+            samples.clone(),
+            session_id,
+            chunk_index,
+            cancellation,
+        )
+        .await;
 
         assert_eq!(result.unwrap(), "chunk transcript");
         assert_eq!(
@@ -779,7 +799,11 @@ mod tests {
         let buffer = RecordingBuffer::new(Arc::new(Mutex::new(samples)));
         let (command_tx, command_rx) = oneshot::channel();
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let transcribe_started = started.clone();
+        let transcribe_finished = finished.clone();
+        let cancellation = CancellationToken::new();
+        let transcribe_cancellation = cancellation.clone();
         let task = tokio::spawn(run_session(
             PauseSegmenter::new(settings()),
             buffer,
@@ -787,12 +811,19 @@ mod tests {
             Duration::from_millis(1),
             move |_samples, _index| {
                 transcribe_started.store(true, std::sync::atomic::Ordering::Relaxed);
-                std::future::pending::<Result<String>>()
+                let cancellation = transcribe_cancellation.clone();
+                let finished = transcribe_finished.clone();
+                async move {
+                    cancellation.cancelled().await;
+                    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Err(anyhow::anyhow!("cancelled"))
+                }
             },
         ));
         let session = PauseChunkingSession {
             command_tx: Some(command_tx),
             task,
+            cancellation: cancellation.clone(),
         };
 
         tokio::time::timeout(Duration::from_millis(100), async {
@@ -806,5 +837,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), session.cancel())
             .await
             .expect("cancellation should not wait for inference");
+        assert!(cancellation.is_cancelled());
+        assert!(finished.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

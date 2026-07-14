@@ -209,6 +209,12 @@ impl AudioStreamManager {
         ))
     }
 
+    pub fn cancel_recording(&self) {
+        bench_trace::event("audio_cancel_begin");
+        discard_recording(&self.active_stream, &self.state, &self.samples);
+        bench_trace::event("audio_cancel_done");
+    }
+
     async fn stop_recording_inner(
         &self,
         retain_snapshot: bool,
@@ -280,6 +286,16 @@ impl AudioStreamManager {
             bench_trace::event("audio_stream_dropped");
         }
     }
+}
+
+fn discard_recording(
+    active_stream: &Arc<Mutex<Option<cpal::Stream>>>,
+    state: &Arc<Mutex<RecordingState>>,
+    samples: &Arc<Mutex<Vec<f32>>>,
+) {
+    active_stream.lock().unwrap().take();
+    samples.lock().unwrap().clear();
+    *state.lock().unwrap() = RecordingState::Idle;
 }
 
 fn trace_vad_output(output: &VadOutput) {
@@ -458,5 +474,18 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(*state.lock().unwrap(), RecordingState::Idle);
+    }
+
+    #[test]
+    fn discard_recording_drops_samples_and_restores_idle() {
+        let active_stream = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(RecordingState::Recording));
+        let samples = Arc::new(Mutex::new(vec![0.1, 0.2, 0.3]));
+
+        discard_recording(&active_stream, &state, &samples);
+
+        assert_eq!(*state.lock().unwrap(), RecordingState::Idle);
+        assert!(samples.lock().unwrap().is_empty());
+        assert!(active_stream.lock().unwrap().is_none());
     }
 }
